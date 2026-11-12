@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include <tuple>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -2201,92 +2203,30 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
-ggml_tensor * llm_graph_context::build_moe_ffn(
-         ggml_tensor * cur,
-         ggml_tensor * gate_inp,
-         ggml_tensor * up_exps,
-         ggml_tensor * gate_exps,
-         ggml_tensor * down_exps,
-         ggml_tensor * exp_probs_b,
-             int64_t   n_expert,
-             int64_t   n_expert_used,
-     llm_ffn_op_type   type_op,
-                bool   norm_w,
-               float   w_scale,
-         llama_expert_gating_func_type gating_op,
-                 int   il,
-         ggml_tensor * probs_in,
-         ggml_tensor * gate_up_exps,
-         ggml_tensor * up_exps_s,
-         ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in,
-         ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
-    return build_moe_ffn(
-        cur,
-        gate_inp,  /* gate_inp_b  */ nullptr,
-        up_exps,   /* up_exps_b   */ nullptr,
-        gate_exps, /* gate_exps_b */ nullptr,
-        down_exps, /* down_exps_b */ nullptr,
-        exp_probs_b,
-        n_expert,
-        n_expert_used,
-        type_op,
-        norm_w,
-        w_scale,
-        gating_op,
-        il,
-        probs_in,
-        gate_up_exps,
-        /* gate_up_exps_b */ nullptr,
-        up_exps_s,
-        gate_exps_s,
-        down_exps_s,
-        selected_experts_in,
-        post_exp_norm,
-        post_exp_norm_eps
-    );
-}
-
-ggml_tensor * llm_graph_context::build_moe_ffn(
+// router logits -> gating -> top-k selection -> expert weights; the op sequence the backends fuse (topk-moe)
+std::pair<ggml_tensor *, ggml_tensor *> llm_graph_context::build_moe_routing(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
          ggml_tensor * gate_inp_b,
-         ggml_tensor * up_exps,
-         ggml_tensor * up_exps_b,
-         ggml_tensor * gate_exps,
-         ggml_tensor * gate_exps_b,
-         ggml_tensor * down_exps,
-         ggml_tensor * down_exps_b,
          ggml_tensor * exp_probs_b,
              int64_t   n_expert,
              int64_t   n_expert_used,
-     llm_ffn_op_type   type_op,
                 bool   norm_w,
                float   w_scale,
         llama_expert_gating_func_type gating_op,
                  int   il,
          ggml_tensor * probs_in,
-         ggml_tensor * gate_up_exps,
-         ggml_tensor * gate_up_exps_b,
-         ggml_tensor * up_exps_s,
-         ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in,
-         ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+         ggml_tensor * selected_experts_in) const {
     const llm_arch arch = model.arch;
-    const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
-    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS || arch == LLM_ARCH_FLINT) {
             // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L565
+            // Flint: a BF16 router must not round the activations to BF16, near-ties in the top-k flip
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
@@ -2421,6 +2361,94 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    return {selected_experts, weights};
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         ggml_tensor * up_exps,
+         ggml_tensor * gate_exps,
+         ggml_tensor * down_exps,
+         ggml_tensor * exp_probs_b,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+     llm_ffn_op_type   type_op,
+                bool   norm_w,
+               float   w_scale,
+         llama_expert_gating_func_type gating_op,
+                 int   il,
+         ggml_tensor * probs_in,
+         ggml_tensor * gate_up_exps,
+         ggml_tensor * up_exps_s,
+         ggml_tensor * gate_exps_s,
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * post_exp_norm,
+               float   post_exp_norm_eps) const {
+    return build_moe_ffn(
+        cur,
+        gate_inp,  /* gate_inp_b  */ nullptr,
+        up_exps,   /* up_exps_b   */ nullptr,
+        gate_exps, /* gate_exps_b */ nullptr,
+        down_exps, /* down_exps_b */ nullptr,
+        exp_probs_b,
+        n_expert,
+        n_expert_used,
+        type_op,
+        norm_w,
+        w_scale,
+        gating_op,
+        il,
+        probs_in,
+        gate_up_exps,
+        /* gate_up_exps_b */ nullptr,
+        up_exps_s,
+        gate_exps_s,
+        down_exps_s,
+        selected_experts_in,
+        post_exp_norm,
+        post_exp_norm_eps
+    );
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         ggml_tensor * gate_inp_b,
+         ggml_tensor * up_exps,
+         ggml_tensor * up_exps_b,
+         ggml_tensor * gate_exps,
+         ggml_tensor * gate_exps_b,
+         ggml_tensor * down_exps,
+         ggml_tensor * down_exps_b,
+         ggml_tensor * exp_probs_b,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+     llm_ffn_op_type   type_op,
+                bool   norm_w,
+               float   w_scale,
+        llama_expert_gating_func_type gating_op,
+                 int   il,
+         ggml_tensor * probs_in,
+         ggml_tensor * gate_up_exps,
+         ggml_tensor * gate_up_exps_b,
+         ggml_tensor * up_exps_s,
+         ggml_tensor * gate_exps_s,
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * post_exp_norm,
+               float   post_exp_norm_eps) const {
+    const llm_arch arch = model.arch;
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+
+    ggml_tensor * selected_experts = nullptr;
+    ggml_tensor * weights          = nullptr;
+    std::tie(selected_experts, weights) = build_moe_routing(cur, gate_inp, gate_inp_b, exp_probs_b, n_expert, n_expert_used,
+        norm_w, w_scale, gating_op, il, probs_in, selected_experts_in);
 
     // compute the expert input before the slot lookup, so that the scheduler prefetches it for the CPU part (the router can read a different tensor)
     ggml_build_forward_expand(gf, cur);
@@ -3700,14 +3728,15 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
+    // expand k later to enable rope fusion which directly writes into k-v cache
     ggml_build_forward_expand(gf, q_cur);
-
-    if (k_cur) {
-        ggml_build_forward_expand(gf, k_cur);
-    }
 
     if (v_cur) {
         ggml_build_forward_expand(gf, v_cur);
+    }
+
+    if (k_cur) {
+        ggml_build_forward_expand(gf, k_cur);
     }
 
     // whole seq fits into batch in training mode

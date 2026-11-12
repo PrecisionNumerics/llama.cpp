@@ -17,7 +17,7 @@ void llama_model_flint::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_flint::load_arch_tensors(llama_model_loader &) {
+void llama_model_flint::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t n_ff_exp        = hparams.n_ff_exp();
@@ -26,6 +26,9 @@ void llama_model_flint::load_arch_tensors(llama_model_loader &) {
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+
+    expert_groups.assign(n_layer, {});
+    shared_experts.assign(n_layer, {});
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -57,15 +60,47 @@ void llama_model_flint::load_arch_tensors(llama_model_loader &) {
                 throw std::runtime_error("n_expert_used must be > 0");
             }
 
-            // MoE branch
-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
-            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+            // MoE branch: either one tensor per projection, or mixed-precision expert groups
+            int64_t n_grouped = 0;
+            for (int g = 0; g < GGML_MUL_MAT_ID_MULTI_MAX; ++g) {
+                const std::string w = "g" + std::to_string(g) + ".weight";
+                const ggml_tensor * meta = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, w.c_str(), i).str().c_str());
+                if (meta == nullptr) {
+                    break;
+                }
+                const int64_t n_group_exp = meta->ne[2];
+                expert_group grp;
+                grp.gate_up = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, w.c_str(), i), {  n_embd, 2*n_ff_exp, n_group_exp}, 0);
+                grp.down    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    w.c_str(), i), {n_ff_exp,     n_embd, n_group_exp}, 0);
+                expert_groups[i].push_back(grp);
+                n_grouped += n_group_exp;
+            }
+            if (n_grouped > n_expert) {
+                throw std::runtime_error("expert groups hold more than n_expert experts");
+            }
+            if (!expert_groups[i].empty() && n_grouped < n_expert && layer.ffn_exp_probs_b == nullptr) {
+                throw std::runtime_error("pruned experts need ffn_exp_probs_b to keep them from being selected");
+            }
+            if (expert_groups[i].empty()) {
+                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+            }
 
-            // Shared expert branch
-            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, hparams.n_ff_shexp}, 0);
-            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        hparams.n_ff_shexp, n_embd}, 0);
-            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, hparams.n_ff_shexp}, 0);
+            // Shared expert branch: with expert groups it can be split into experts of n_ff_exp, run by the same op
+            const ggml_tensor * sh_meta = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "shared.weight", i).str().c_str());
+            if (sh_meta != nullptr && !expert_groups[i].empty()) {
+                const int64_t n_sh = sh_meta->ne[2];
+                if (n_sh * n_ff_exp != (int64_t) hparams.n_ff_shexp) {
+                    throw std::runtime_error("shared experts do not add up to the shared expert");
+                }
+                shared_experts[i].gate_up = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "shared.weight", i), {  n_embd, 2*n_ff_exp, n_sh}, 0);
+                shared_experts[i].down    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "shared.weight", i), {n_ff_exp,     n_embd, n_sh}, 0);
+            } else {
+                layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, hparams.n_ff_shexp}, 0);
+                layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        hparams.n_ff_shexp, n_embd}, 0);
+                layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, hparams.n_ff_shexp}, 0);
+            }
         }
     }
 }
@@ -148,7 +183,10 @@ llama_model_flint::graph::graph(const llm_graph_params & params) :
                     NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
-            ggml_tensor * moe_out = build_moe_ffn(cur,
+            const auto & flint  = static_cast<const llama_model_flint &>(model);
+            const auto & groups = flint.expert_groups[il];
+            const auto & shared = flint.shared_experts[il];
+            ggml_tensor * moe_out = !groups.empty() ? build_grouped_moe(cur, groups, shared, il) : build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,
                 model.layers[il].ffn_up_exps,
                 model.layers[il].ffn_gate_exps,
@@ -164,7 +202,9 @@ llama_model_flint::graph::graph(const llm_graph_params & params) :
                 model.layers[il].ffn_down_exps_s);
             cb(moe_out, "ffn_moe_out", il);
 
-            {
+            if (shared.gate_up) {
+                cur = moe_out; // the shared expert is in moe_out
+            } else {
                 ggml_tensor * ffn_shexp =
                     build_ffn(cur,
                         model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
@@ -173,9 +213,10 @@ llama_model_flint::graph::graph(const llm_graph_params & params) :
                         NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
                 cb(ffn_shexp, "ffn_shexp", il);
 
-                cur = ggml_add(ctx0, moe_out, ffn_shexp);
-                cb(cur, "ffn_out", il);
+                // grouped experts: shared expert first in the graph, so cur stays alive and the fused gate/up/glu matvec output does not alias it
+                cur = groups.empty() ? ggml_add(ctx0, moe_out, ffn_shexp) : ggml_add(ctx0, ffn_shexp, moe_out);
             }
+            cb(cur, "ffn_out", il);
         }
         cur = ggml_add(ctx0, cur, ffn_inp);
 
@@ -197,4 +238,34 @@ llama_model_flint::graph::graph(const llm_graph_params & params) :
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+}
+
+// The router (and its fused top-k) over all experts, then one mul_mat_id_multi over the groups for
+// gate_up with the swiglu, and one for down with the weighted sum over the selected experts. The shared
+// experts, if given, run in the same ops.
+ggml_tensor * llama_model_flint::graph::build_grouped_moe(ggml_tensor * cur, const std::vector<expert_group> & groups,
+        const expert_group & shared, int il) {
+    const auto & layer = model.layers[il];
+    const int64_t n_tokens = cur->ne[1];
+
+    auto [selected, weights] = build_moe_routing(cur, layer.ffn_gate_inp, nullptr, layer.ffn_exp_probs_b,
+        n_expert, n_expert_used, hparams.expert_weights_norm, hparams.expert_weights_scale,
+        (llama_expert_gating_func_type) hparams.expert_gating_func, il);
+
+    ggml_tensor * gate_up[GGML_MUL_MAT_ID_MULTI_MAX];
+    ggml_tensor * down[GGML_MUL_MAT_ID_MULTI_MAX];
+    const int n_groups = (int) groups.size();
+    for (int g = 0; g < n_groups; ++g) {
+        gate_up[g] = groups[g].gate_up;
+        down[g]    = groups[g].down;
+    }
+
+    ggml_tensor * x = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_tokens);
+
+    ggml_tensor * act = ggml_mul_mat_id_multi(ctx0, gate_up, n_groups, x, selected, nullptr, shared.gate_up, true); // [n_ff_exp, n_slots, n_tokens]
+    cb(act, "ffn_moe_swiglu", il);
+
+    weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+    // [n_embd, n_tokens, 1]: no reshape, so the residual add follows the op directly and the CUDA backend can fuse it
+    return ggml_mul_mat_id_multi(ctx0, down, n_groups, act, selected, weights, shared.down, false);
 }
