@@ -146,6 +146,19 @@ static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
 #endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// L2 prefetch of [p, p + bytes), spread over the threads of a block: issued before ggml_cuda_pdl_sync() for data that
+// does not depend on the previous kernel (weights), so their DRAM latency overlaps the previous kernel
+static __device__ __forceinline__ void ggml_cuda_prefetch_l2(const void * p, const int64_t bytes, const int tid, const int nthreads) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    const char * c = (const char *) p;
+    for (int64_t off = (int64_t) tid * 128; off < bytes; off += (int64_t) nthreads * 128) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(c + off));
+    }
+#else
+    GGML_UNUSED_VARS(p, bytes, tid, nthreads);
+#endif
+}
+
 static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaTriggerProgrammaticLaunchCompletion();
@@ -1363,6 +1376,43 @@ struct ggml_backend_cuda_context {
 #endif
 
     int curr_stream_no = 0;
+
+    // q8_1 copy of a small activation (up to q8_1_max_rows contiguous rows), written by the fused RMS_NORM+MUL
+    // kernel and read by mul_mat_vec_q / mul_mat_id_multi instead of quantizing it again.
+    // Two buffers, so that a producer may read the current entry while it writes the next one.
+    static constexpr int    q8_1_max_rows  = 32;
+    static constexpr int    q8_1_max_ncols = 8192;
+    static constexpr size_t q8_1_buf_size  = q8_1_max_rows * (q8_1_max_ncols / QK8_1) * sizeof(block_q8_1);
+
+    const ggml_tensor * q8_1_src    = nullptr;
+    void *              q8_1_buf[2] = { nullptr, nullptr };
+    int                 q8_1_cur    = 0;
+
+    void * q8_1_next_buf() {
+        if (q8_1_buf[0] == nullptr) {
+            // allocated once (the first, eager evaluation) so that it never happens during graph capture
+            CUDA_CHECK(cudaMalloc(&q8_1_buf[0], q8_1_buf_size));
+            CUDA_CHECK(cudaMalloc(&q8_1_buf[1], q8_1_buf_size));
+        }
+        return q8_1_buf[q8_1_cur ^ 1];
+    }
+
+    // call after launching the producer that wrote q8_1_next_buf()
+    void q8_1_set(const ggml_tensor * t) {
+        q8_1_cur ^= 1;
+        q8_1_src  = t;
+    }
+
+    const void * q8_1_lookup(const ggml_tensor * t) const {
+        if (t == nullptr || q8_1_src == nullptr || curr_stream_no != 0) {
+            return nullptr;
+        }
+        // a reshape of the whole tensor has the same data
+        const bool same = t == q8_1_src ||
+            (t->view_src == q8_1_src && t->view_offs == 0 && t->data == q8_1_src->data && t->type == q8_1_src->type &&
+             t->ne[0] == q8_1_src->ne[0] && ggml_nrows(t) == ggml_nrows(q8_1_src) && ggml_is_contiguous(t));
+        return same ? q8_1_buf[q8_1_cur] : nullptr;
+    }
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
