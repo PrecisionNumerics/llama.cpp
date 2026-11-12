@@ -12398,3 +12398,92 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_mul_mat_id_multi
+
+// reference implementation: each expert row is dequantized to F32 and dotted with the F32 input
+void ggml_compute_forward_mul_mat_id_multi(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const int  n_as   = ggml_get_op_params_i32(dst, 0);
+    const bool swiglu = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const ggml_tensor * b   = dst->src[n_as + 0];
+    const ggml_tensor * ids = dst->src[n_as + 1];
+    const ggml_tensor * w   = dst->src[n_as + 2];
+    const ggml_tensor * sh  = dst->src[n_as + 3];
+
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t cols     = b->ne[0];
+    const int64_t rows     = dst->src[0]->ne[1];
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_slots  = n_used + (sh ? sh->ne[2] : 0);
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t out_rows = swiglu ? rows / 2 : rows;
+
+    int64_t first[GGML_MUL_MAT_ID_MULTI_MAX + 1] = { 0 };
+    for (int g = 0; g < n_as; ++g) {
+        first[g + 1] = first[g] + dst->src[g]->ne[2];
+    }
+
+    std::vector<float> wrow(cols);
+    std::vector<float> prod(rows);
+
+    const int64_t n_out = w ? n_tokens : n_tokens * n_slots;
+    for (int64_t j = params->ith; j < n_out; j += params->nth) {
+        const int64_t t  = w ? j : j / n_slots;
+        const int64_t s0 = w ? 0 : j % n_slots;
+        const int64_t s1 = w ? n_slots : s0 + 1;
+
+        float * out = w ? (float *) ((char *) dst->data + t * dst->nb[1])
+                        : (float *) ((char *) dst->data + s0 * dst->nb[1] + t * dst->nb[2]);
+        std::fill(out, out + out_rows, 0.0f);
+
+        for (int64_t s = s0; s < s1; ++s) {
+            const ggml_tensor * a;
+            int64_t e; // expert of a
+            if (s < n_used) {
+                const int32_t id = *(const int32_t *) ((const char *) ids->data + s * ids->nb[0] + t * ids->nb[1]);
+                if (id < 0) {
+                    continue; // skipped slot
+                }
+                int g = 0;
+                while (g < n_as && id >= first[g + 1]) {
+                    ++g;
+                }
+                GGML_ASSERT(g < n_as && "expert id out of range");
+                a = dst->src[g];
+                e = id - first[g];
+            } else {
+                a = sh;
+                e = s - n_used;
+            }
+            const auto to_float = ggml_get_type_traits(a->type)->to_float;
+
+            const float * x = (const float *) ((const char *) b->data + (b->ne[1] == 1 ? 0 : s) * b->nb[1] + t * b->nb[2]);
+            const char * ae = (const char *) a->data + e * a->nb[2];
+            for (int64_t r = 0; r < rows; ++r) {
+                to_float(ae + r * a->nb[1], wrow.data(), cols);
+                float sum = 0.0f;
+                for (int64_t c = 0; c < cols; ++c) {
+                    sum += wrow[c] * x[c];
+                }
+                prod[r] = sum;
+            }
+
+            if (swiglu) {
+                for (int64_t r = 0; r < out_rows; ++r) {
+                    const float gate = prod[r];
+                    out[r] = gate / (1.0f + expf(-gate)) * prod[r + out_rows];
+                }
+            } else {
+                const float ws = w && s < n_used ? ((const float *) w->data)[s + t * n_used] : 1.0f;
+                for (int64_t r = 0; r < rows; ++r) {
+                    out[r] += ws * prod[r];
+                }
+            }
+        }
+    }
+}
