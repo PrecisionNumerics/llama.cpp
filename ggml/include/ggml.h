@@ -429,6 +429,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MUL_MAT_ID_MULTI,
+
         GGML_OP_COUNT,
     };
 
@@ -1325,6 +1327,21 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // mul_mat_id over experts split into up to GGML_MUL_MAT_ID_MULTI_MAX tensors of possibly different types:
+    // as[0] holds experts [0, n0), as[1] the next as[1]->ne[2], ... (all with the same ne[0], ne[1]); an id of -1 skips the slot
+    //   swiglu: c = silu(rows [0, ne1/2)) * rows [ne1/2, ne1) of each slot's product -> [ne1/2, n_expert_used, n_tokens]
+    //   w:      if not NULL ([n_expert_used, n_tokens] F32), c = sum over slots of w * product     -> [rows, n_tokens]
+    #define GGML_MUL_MAT_ID_MULTI_MAX 4
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_multi(
+            struct ggml_context * ctx,
+            struct ggml_tensor ** as,
+            int                   n_as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * shared,
+            bool                  swiglu);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

@@ -5910,6 +5910,124 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID_MULTI: experts split into tensors of different types
+struct test_mul_mat_id_multi : public test_case {
+    const std::array<ggml_type, 3> types;
+    const std::array<int, 3> counts; // experts per tensor, 0 = unused
+    const int n_used;
+    const bool b;      // broadcast b
+    const bool swiglu;
+    const bool weighted;
+    const int64_t m;   // rows of each expert
+    const int64_t n;   // tokens
+    const int64_t k;
+    const bool skip;   // some ids -1
+    const float b_amp; // activations in [-b_amp, b_amp]; large values overflow F16 block sums
+    const int n_shared; // shared experts (Q4_0), used by every token
+
+    std::string vars() override {
+        return VARS_TO_STR12(types, counts, n_used, b, swiglu, weighted, m, n, k, skip, b_amp, n_shared);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    int n_as() const { int r = 0; for (int c : counts) { r += c > 0; } return r; }
+    int n_total() const { int r = 0; for (int c : counts) { r += c; } return r; }
+
+    test_mul_mat_id_multi(std::array<ggml_type, 3> types = {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0},
+            std::array<int, 3> counts = {5, 7, 3}, int n_used = 4, bool b = true, bool swiglu = true, bool weighted = false,
+            int64_t m = 64, int64_t n = 8, int64_t k = 256, bool skip = false, float b_amp = 1.0f, int n_shared = 0)
+        : types(types), counts(counts), n_used(n_used), b(b), swiglu(swiglu), weighted(weighted), m(m), n(n), k(k), skip(skip), b_amp(b_amp),
+          n_shared(n_shared) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as[3];
+        int na = 0;
+        for (int g = 0; g < 3; ++g) {
+            if (counts[g] > 0) {
+                as[na] = ggml_new_tensor_3d(ctx, types[g], k, m, counts[g]);
+                ggml_set_name(as[na], ("as" + std::to_string(g)).c_str());
+                na++;
+            }
+        }
+        // like the router's top-k: a view of the first n_used of n_total sorted ids
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_total(), n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_set_name(ids, "view_of_ids");
+        ggml_tensor * bt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used + n_shared, n);
+        ggml_set_name(bt, "b");
+        ggml_tensor * w = nullptr;
+        if (weighted) {
+            w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_used, n);
+            ggml_set_name(w, "w");
+        }
+        ggml_tensor * sh = nullptr;
+        if (n_shared > 0) {
+            sh = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, k, m, n_shared);
+            ggml_set_name(sh, "shared");
+        }
+        ggml_tensor * out = ggml_mul_mat_id_multi(ctx, as, na, bt, ids, w, sh, swiglu);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void init_ids(ggml_context * ctx) {
+        std::default_random_engine rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            std::vector<int32_t> data(ggml_nelements(t));
+            std::vector<int32_t> perm(n_total());
+            for (int64_t r = 0; r < t->ne[1]; ++r) {
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                for (int64_t s = 0; s < t->ne[0]; ++s) {
+                    data[r*t->ne[0] + s] = skip && (rng() % 4 == 0) ? -1 : perm[s];
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                continue;
+            }
+            if (std::string(t->name) == "w") {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (std::string(t->name) == "b") {
+                init_tensor_uniform(t, -b_amp, b_amp);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+        init_ids(ctx);
+    }
+};
+
+// weighted MUL_MAT_ID_MULTI followed by a residual add (fused by the CUDA backend)
+struct test_mul_mat_id_multi_add : public test_mul_mat_id_multi {
+    test_mul_mat_id_multi_add(std::array<ggml_type, 3> types, std::array<int, 3> counts, int n_used, int64_t m, int64_t n,
+            int64_t k, bool skip, int n_shared)
+        : test_mul_mat_id_multi(types, counts, n_used, false, false, true, m, n, k, skip, 1.0f, n_shared) {}
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MUL_MAT_ID_MULTI"; }
+    std::string vars() override { return test_mul_mat_id_multi::vars() + ",add=1"; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * moe = test_mul_mat_id_multi::build_graph(ctx);
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_set_name(res, "res");
+        ggml_tensor * out = ggml_add(ctx, moe, res);
+        ggml_set_name(out, "out_add");
+        return out;
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -12294,6 +12412,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // skipped slots at mixed-precision MoE shapes (Flint: 6 of n experts, gate/up broadcast, down per slot)
+    for (ggml_type type_a : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0}) {
+        for (int n : {1, 3, 8, 33, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 94, 6, true,  512, n, 2048, 0, false, true));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 94, 6, false, 2048, n, 512, 0, false, true));
+        }
+    }
+    // experts split across tensors of different types
+    {
+        const std::array<ggml_type, 3> mixed = {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0};
+        for (int n : {1, 3, 8, 16, 32, 33, 129, 512}) {
+            for (bool skip : {false, true}) {
+                // gate_up: broadcast b, swiglu; down: per-slot b, weighted sum; plain
+                test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {5, 7, 3}, 4, true,  true,  false, 128, n, 256, skip));
+                test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {5, 7, 3}, 4, false, false, true,  64,  n, 256, skip));
+                test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {5, 7, 3}, 4, false, false, false, 64,  n, 256, skip));
+                test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {5, 7, 3}, 4, true,  false, false, 64,  n, 256, skip));
+            }
+            // Flint shapes
+            test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {40, 34, 20}, 6, true,  true,  false, 1024, n, 2048, true));
+            test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {40, 34, 20}, 6, false, false, true,  2048, n, 512,  true));
+        }
+        for (int n : {1, 8, 32, 33}) { // activations whose q8_1 block sums overflow F16
+            test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {40, 34, 20}, 6, true,  true,  false, 1024, n, 2048, false, 5000.0f));
+            test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {40, 34, 20}, 6, false, false, true,  2048, n, 512,  false, 5000.0f));
+        }
+        for (int n : {1, 3, 8, 32, 33, 129}) { // with shared experts
+            test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {5, 7, 3}, 4, true,  true,  false, 128, n, 256, true,  1.0f, 2));
+            test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {5, 7, 3}, 4, false, false, true,  64,  n, 256, true,  1.0f, 2));
+            test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {5, 7, 3}, 4, false, false, false, 64,  n, 256, false, 1.0f, 1));
+            test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {40, 34, 20}, 6, true,  true,  false, 1024, n, 2048, true, 1.0f, 2));
+            test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {40, 34, 20}, 6, false, false, true,  2048, n, 512,  true, 1.0f, 2));
+        }
+        for (int n : {1, 3, 8, 32, 129, 512}) { // + residual add
+            test_cases.emplace_back(new test_mul_mat_id_multi_add(mixed, {5, 7, 3}, 4, 64, n, 256, true, 2));
+            test_cases.emplace_back(new test_mul_mat_id_multi_add(mixed, {40, 34, 20}, 6, 2048, n, 512, true, 2));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_multi_add({GGML_TYPE_Q5_1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {6, 0, 0}, 3, 64, 8, 256, true, 0));
+        for (int n : {1, 8, 64}) {
+            test_cases.emplace_back(new test_mul_mat_id_multi({GGML_TYPE_Q4_1, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0}, {2, 3, 0}, 2, true, true, false, 64, n, 256, false));
+            test_cases.emplace_back(new test_mul_mat_id_multi({GGML_TYPE_Q5_1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {6, 0, 0}, 3, false, false, true, 64, n, 256, true));
+        }
+    }
     // n_used == n_mats, so every expert can be skipped
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 4, false, 512, 64, 256, 0, false, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1, 0, false, true));
@@ -13426,6 +13587,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Flint-sized MoE layer: experts split across Q1_0 / Q2_0 / Q4_0 tensors, plus 2 shared experts
+    for (int n : {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 2048}) {
+        const std::array<ggml_type, 3> mixed = {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0};
+        test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {96, 128, 32}, 6, true,  true,  false, 1024, n, 2048, false, 1.0f, 2));
+        test_cases.emplace_back(new test_mul_mat_id_multi(mixed, {96, 128, 32}, 6, false, false, true,  2048, n, 512,  false, 1.0f, 2));
+    }
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));

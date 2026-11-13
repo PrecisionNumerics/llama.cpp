@@ -575,6 +575,25 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
+// bytes per quant block, for the L2 prefetch of the weight rows (0: not prefetched)
+static constexpr __host__ __device__ int mmvq_block_bytes(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0: return sizeof(block_q1_0);
+        case GGML_TYPE_Q2_0: return sizeof(block_q2_0);
+        case GGML_TYPE_Q4_0: return sizeof(block_q4_0);
+        case GGML_TYPE_Q4_1: return sizeof(block_q4_1);
+        case GGML_TYPE_Q5_0: return sizeof(block_q5_0);
+        case GGML_TYPE_Q5_1: return sizeof(block_q5_1);
+        case GGML_TYPE_Q8_0: return sizeof(block_q8_0);
+        case GGML_TYPE_Q2_K: return sizeof(block_q2_K);
+        case GGML_TYPE_Q3_K: return sizeof(block_q3_K);
+        case GGML_TYPE_Q4_K: return sizeof(block_q4_K);
+        case GGML_TYPE_Q5_K: return sizeof(block_q5_K);
+        case GGML_TYPE_Q6_K: return sizeof(block_q6_K);
+        default:             return 0;
+    }
+}
+
 // Low bit types load few weight bytes per thread, a second row per block shares the q8_1 loads and adds memory parallelism.
 static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
     switch (type) {
@@ -583,6 +602,7 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_Q4_0: // +2% at batch 1 on RTX 5090
             return true;
         default:
             return false;
@@ -655,6 +675,24 @@ static __global__ void mul_mat_vec_q(
     uint32_t channel_x;
     uint32_t channel_y;
     uint32_t sample_dst;
+
+    // the weight rows of this block do not depend on the previous kernel (without ids): start loading them into L2
+    if constexpr (mmvq_block_bytes(type) > 0) {
+        if (ids == nullptr && !shared_expert) {
+            const uint32_t cx = fastdiv(channel_dst, channel_ratio);
+            const uint32_t sx = fastdiv(blockIdx.z, sample_ratio);
+            const int64_t  first = (int64_t) sx*stride_sample_x + (int64_t) cx*stride_channel_x + (int64_t) row0*stride_row_x;
+            // rows of the last block past the end of the matrix are not prefetched (they may be past the buffer)
+            const int      nr    = rows_per_cuda_block == 1 ? 1 : min(rows_per_cuda_block, (int) stride_col_dst - row0);
+            const int64_t  bytes = (int64_t) nr*stride_row_x*mmvq_block_bytes(type);
+            ggml_cuda_prefetch_l2((const char *) vx + first*mmvq_block_bytes(type), bytes, tid, nwarps*warp_size);
+            if constexpr (has_fusion) {
+                if (fusion.gate != nullptr) {
+                    ggml_cuda_prefetch_l2((const char *) fusion.gate + first*mmvq_block_bytes(type), bytes, tid, nwarps*warp_size);
+                }
+            }
+        }
+    }
 
     ggml_cuda_pdl_sync();
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
@@ -1546,8 +1584,10 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const void * src1_q8_1_cached = !ids && ne12 == 1 && ne13 == 1 && ne10 == ne10_padded ? ctx.q8_1_lookup(src1) : nullptr;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (!src1_q8_1_cached) {
+        src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -1577,7 +1617,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_cached ? src1_q8_1_cached : src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

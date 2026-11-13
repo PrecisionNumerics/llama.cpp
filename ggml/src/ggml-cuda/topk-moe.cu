@@ -248,6 +248,55 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 
     ggml_cuda_pdl_lc();
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    // redux.sync selection: per round one max over an order-preserving integer key of each lane's best selection value
+    // and one min over the expert ids that reach it (lowest id wins ties): the same experts in the same order as the
+    // shuffle tree below, with a shorter dependency chain
+    {
+        auto & sel = [&]() -> auto & {
+            if constexpr (has_bias) {
+                return selection_wt;
+            } else {
+                return wt;
+            }
+        }();
+        for (int k = 0; k < n_expert_used; k++) {
+            float best   = sel[0];
+            float best_w = wt[0];
+            int   best_e = threadIdx.x;
+#pragma unroll
+            for (int i = 1; i < experts_per_thread; i++) {
+                const int expert = threadIdx.x + i * WARP_SIZE;
+                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && sel[i] > best) {
+                    best   = sel[i];
+                    best_w = wt[i];
+                    best_e = expert;
+                }
+            }
+            unsigned int b = __float_as_uint(best);
+            b = (b << 1) == 0 ? 0x80000000u : (b & 0x80000000u) ? ~b : (b | 0x80000000u); // -0 == +0
+            const unsigned int kmax       = __reduce_max_sync(0xFFFFFFFF, b);
+            const int          max_expert = (int) __reduce_min_sync(0xFFFFFFFF, b == kmax ? (unsigned int) best_e : 0xFFFFFFFFu);
+            const float        max_val    = __shfl_sync(0xFFFFFFFF, best_w, max_expert & (WARP_SIZE - 1), WARP_SIZE);
+
+            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+#pragma unroll
+                for (int i = 0; i < experts_per_thread; i++) {
+                    if (i == max_expert / WARP_SIZE) {
+                        sel[i] = -INFINITY;
+                    }
+                }
+                ids[k] = max_expert;
+                if (config.with_norm) {
+                    wt_sum += max_val;
+                }
+            }
+            if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
+                output_weights[k / WARP_SIZE] = max_val;
+            }
+        }
+    }
+#else
     for (int k = 0; k < n_expert_used; k++) {
         float max_val    = wt[0];
         int   max_expert = threadIdx.x;
@@ -316,6 +365,7 @@ __global__ void topk_moe_cuda(const float *         logits,
             }
         }
     }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
     if (config.with_norm) {
         wt_sum              = warp_reduce_sum(wt_sum);

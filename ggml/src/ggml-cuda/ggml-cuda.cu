@@ -32,6 +32,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid-multi.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -917,6 +918,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    for (void * buf : q8_1_buf) {
+        if (buf != nullptr) {
+            CUDA_CHECK(cudaFree(buf));
+        }
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -2902,6 +2908,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_MUL_MAT_ID_MULTI:
+            ggml_cuda_mul_mat_id_multi(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -4343,6 +4352,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // MoE down projection + residual add: the weighted sum over the experts adds the residual and writes the add's output
+    if (node->op == GGML_OP_MUL_MAT_ID_MULTI && ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT_ID_MULTI, GGML_OP_ADD })) {
+        ggml_tensor * add = cgraph->nodes[i + 1];
+        const ggml_tensor * res = add->src[0] == node ? add->src[1] : add->src[0];
+        if (ggml_cuda_mul_mat_id_multi_can_fuse_add(node, res, add)) {
+            ggml_cuda_mul_mat_id_multi(*cuda_ctx, node, res, add);
+            return 1;
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -5419,6 +5438,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->q8_1_src = nullptr;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6257,6 +6277,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
+        case GGML_OP_MUL_MAT_ID_MULTI:
+            return ggml_cuda_mul_mat_id_multi_supported(op);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -6696,6 +6718,8 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
             return 0;
         case GGML_OP_MUL_MAT:
             return op->ne[1];
+        case GGML_OP_MUL_MAT_ID_MULTI:
+            return op->src[ggml_get_op_params_i32(op, 0) + 1]->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:

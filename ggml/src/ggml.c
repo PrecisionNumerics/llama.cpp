@@ -1112,9 +1112,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MUL_MAT_ID_MULTI",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1227,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "X[i]*Y (multi)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3422,6 +3426,68 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_mul_mat_id_multi
+
+/*
+    as[g]  -> [cols, rows, n_g]: experts [sum_{h<g} n_h, sum_{h<=g} n_h) of one id space
+    shared -> [cols, rows, n_shared] or NULL: experts used by every token, with weight 1
+    n_slots = n_expert_used + n_shared: the routed slots, then one slot per shared expert
+    b      -> [cols, 1 or n_slots, n_tokens]
+    ids    -> [n_expert_used, n_tokens] (i32), -1 skips the slot
+    w      -> [n_expert_used, n_tokens] (f32) or NULL
+    c      -> [rows (rows/2 with swiglu), n_slots, n_tokens], or [rows, n_tokens] with w
+
+    op params: n_as, swiglu
+    src: as[0..n_as), b, ids, w, shared
+*/
+struct ggml_tensor * ggml_mul_mat_id_multi(
+        struct ggml_context * ctx,
+        struct ggml_tensor ** as,
+        int                   n_as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * shared,
+        bool                  swiglu) {
+    const int64_t n_slots = ids->ne[0] + (shared ? shared->ne[2] : 0);
+    GGML_ASSERT(n_as >= 1 && n_as <= GGML_MUL_MAT_ID_MULTI_MAX);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == b->ne[2]);
+    GGML_ASSERT(b->ne[1] == 1 || b->ne[1] == n_slots);
+    for (int g = 0; g < n_as; ++g) {
+        GGML_ASSERT(!ggml_is_transposed(as[g]) && as[g]->ne[3] == 1);
+        GGML_ASSERT(as[g]->ne[0] == b->ne[0] && as[g]->ne[1] == as[0]->ne[1]);
+    }
+    if (shared) {
+        GGML_ASSERT(!ggml_is_transposed(shared) && shared->ne[3] == 1);
+        GGML_ASSERT(shared->ne[0] == b->ne[0] && shared->ne[1] == as[0]->ne[1]);
+    }
+    GGML_ASSERT(!swiglu || as[0]->ne[1] % 2 == 0);
+    GGML_ASSERT(!(swiglu && w)); // gate_up products are not summed
+    if (w) {
+        GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == ggml_nelements(ids));
+    }
+
+    const int64_t rows = swiglu ? as[0]->ne[1] / 2 : as[0]->ne[1];
+    const int64_t ne[4] = { rows, w ? b->ne[2] : n_slots, w ? 1 : b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, w ? 2 : 3, ne);
+
+    const int32_t params[] = { n_as, swiglu ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op = GGML_OP_MUL_MAT_ID_MULTI;
+    for (int g = 0; g < n_as; ++g) {
+        result->src[g] = as[g];
+    }
+    result->src[n_as + 0] = b;
+    result->src[n_as + 1] = ids;
+    result->src[n_as + 2] = w;
+    result->src[n_as + 3] = shared;
 
     return result;
 }

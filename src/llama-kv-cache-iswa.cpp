@@ -168,7 +168,9 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_simple(n_ubatch);
+            // an equal split keeps each ubatch to one sequence or to runs of equal length per sequence, so that
+            // attention reads the K/V rows of each sequence (kv_rows) instead of masking the cells of all of them
+            auto ubatch = embd_all ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, false, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;
