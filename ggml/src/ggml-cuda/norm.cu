@@ -637,6 +637,124 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
+// Single-row RMS norm times a weight row that also writes the result as q8_1 (the layout of quantize_q8_1),
+// so that the following mul_mat_vec_q / mul_mat_id_multi can skip their own quantization.
+// Requires ncols % (4 * block_size) == 0: every group of 8 threads then holds one full q8_1 block.
+template <int block_size, int vpt>
+static __global__ void rms_norm_mul_q8_1_f32(
+        const float * x, const float * mul, float * dst, block_q8_1 * yq, const int ncols, const float eps) {
+    ggml_cuda_pdl_lc();
+    extern __shared__ float s_sum[];
+
+    // one block per contiguous row; ncols is a multiple of QK8_1, so the q8_1 rows are contiguous too
+    x   += (int64_t) blockIdx.x * ncols;
+    dst += (int64_t) blockIdx.x * ncols;
+    yq  += (int64_t) blockIdx.x * (ncols / QK8_1);
+
+    const int      tid    = threadIdx.x;
+    const int      ncols4 = ncols / 4;
+    const float4 * x4     = (const float4 *) x;
+    const float4 * mul4   = (const float4 *) mul;
+    float4 *       dst4   = (float4 *) dst;
+
+    // the weight does not depend on the previous kernel
+    float4 m[vpt];
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            m[k] = mul4[i];
+        }
+    }
+
+    ggml_cuda_pdl_sync();
+
+    float4 xs[vpt];
+    float  tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            xs[k] = x4[i];
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i >= ncols4) {
+            break; // uniform across each block of 32 values
+        }
+        float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+        r.x *= m[k].x;
+        r.y *= m[k].y;
+        r.z *= m[k].z;
+        r.w *= m[k].w;
+        dst4[i] = r;
+
+        float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
+        amax = warp_reduce_max<8>(amax);
+        const float d = amax / 127.0f;
+        char4 q;
+        q.x = amax == 0.0f ? 0 : roundf(r.x / d);
+        q.y = amax == 0.0f ? 0 : roundf(r.y / d);
+        q.z = amax == 0.0f ? 0 : roundf(r.z / d);
+        q.w = amax == 0.0f ? 0 : roundf(r.w / d);
+        // explicit shuffles: the int warp_reduce_sum ignores the width on Ampere+
+        int sum = (int) q.x + (int) q.y + (int) q.z + (int) q.w;
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffff, sum, offset, 8);
+        }
+
+        block_q8_1 & b = yq[i / 8];
+        ((char4 *) b.qs)[i % 8] = q;
+        if (i % 8 == 0) {
+            b.ds = make_half2(d, d * sum);
+        }
+    }
+}
+
+// Tries the q8_1-writing kernel (up to q8_1_max_rows rows); returns false (nothing launched) when it does not apply.
+static bool rms_norm_mul_q8_1_f32_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * x_t, const ggml_tensor * mul_t,
+                                       ggml_tensor * dst_t, const float eps) {
+    constexpr int block_size = 256;
+    constexpr int max_ncols  = 8*4*block_size;
+
+    const int64_t ncols = x_t->ne[0];
+    const int64_t nrows = ggml_nrows(dst_t);
+    if (ctx.curr_stream_no != 0 || nrows > ggml_backend_cuda_context::q8_1_max_rows || ncols % MATRIX_ROW_PADDING != 0 || ncols > max_ncols ||
+        ncols % (4*block_size) != 0 || !ggml_is_contiguous(x_t) || !ggml_is_contiguous(mul_t) || mul_t->ne[0] != ncols ||
+        ggml_nrows(mul_t) != 1 || !ggml_cuda_is_aligned(x_t, 16) || !ggml_cuda_is_aligned(mul_t, 16) ||
+        !ggml_cuda_is_aligned(dst_t, 16) || !ggml_is_contiguous(dst_t) || ggml_nrows(x_t) != nrows) {
+        return false;
+    }
+
+    static_assert(max_ncols <= ggml_backend_cuda_context::q8_1_max_ncols, "q8_1 buffer too small");
+
+    const float * x   = (const float *) x_t->data;
+    const float * mul = (const float *) mul_t->data;
+    float *       dst = (float *) dst_t->data;
+    block_q8_1 *  yq  = (block_q8_1 *) ctx.q8_1_next_buf();
+
+    const int vpt_needed = ncols / (4*block_size);
+    const ggml_cuda_kernel_launch_params launch_params{ dim3(nrows, 1, 1), dim3(block_size, 1, 1), 32 * sizeof(float), ctx.stream() };
+    if (vpt_needed <= 1) {
+        ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<block_size, 1>,  launch_params, x, mul, dst, yq, (int) ncols, eps);
+    } else if (vpt_needed <= 2) {
+        ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<block_size, 2>,  launch_params, x, mul, dst, yq, (int) ncols, eps);
+    } else if (vpt_needed <= 4) {
+        ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<block_size, 4>,  launch_params, x, mul, dst, yq, (int) ncols, eps);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<block_size, 8>,  launch_params, x, mul, dst, yq, (int) ncols, eps);
+    }
+    ctx.q8_1_set(dst_t);
+    return true;
+}
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
@@ -660,6 +778,10 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
     GGML_ASSERT(eps >= 0.0f);
+
+    if (mul_src->type == GGML_TYPE_F32 && rms_norm_mul_q8_1_f32_cuda(ctx, rms_norm_src, mul_src, mul_tensor, eps)) {
+        return;
+    }
 
     const int64_t ne00 = rms_norm_src->ne[0];
     const int64_t ne01 = rms_norm_src->ne[1];

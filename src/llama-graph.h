@@ -1197,6 +1197,21 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il) const;
 
+    // the routing of build_moe_ffn: returns {selected experts [n_expert_used, n_tokens], weights [1, n_expert_used, n_tokens]}
+    std::pair<ggml_tensor *, ggml_tensor *> build_moe_routing(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * gate_inp_b,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+                    bool   norm_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il,
+             ggml_tensor * probs_in = nullptr,
+             ggml_tensor * selected_experts_in = nullptr) const;
+
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,

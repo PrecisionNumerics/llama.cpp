@@ -632,8 +632,21 @@ struct llama_model_flint : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // Mixed-precision routed experts: a layer's experts split into groups of one ggml type each.
+    // Group g holds blk.N.ffn_gate_up_exps.g<g>.weight (gate rows, then up rows) and
+    // blk.N.ffn_down_exps.g<g>.weight with its n_g experts. Global expert ids are the groups in
+    // order (group 0 has ids [0, n_0), group 1 [n_0, n_0 + n_1), ...); ids past the last group are
+    // pruned experts, which the router bias keeps from being selected.
+    struct expert_group {
+        ggml_tensor * gate_up = nullptr;
+        ggml_tensor * down    = nullptr;
+    };
+    std::vector<std::vector<expert_group>> expert_groups; // [n_layer][n_group]
+    std::vector<expert_group> shared_experts;             // [n_layer]: the shared expert split into experts, optional
+
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
+        ggml_tensor * build_grouped_moe(ggml_tensor * cur, const std::vector<expert_group> & groups, const expert_group & shared, int il);
     };
 
     llama_rope_params get_rope_params(const llama_cparams & cparams, int il) const override;
