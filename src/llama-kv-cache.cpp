@@ -808,7 +808,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
-        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+        std::vector<llama_kv_cells::cells_state> v_cells; // copy of the old cells, before placing the ubatch
     };
 
     // remember the old state of the cells so we can restore it in the end

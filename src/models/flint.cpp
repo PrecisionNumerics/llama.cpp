@@ -136,7 +136,9 @@ llama_model_flint::graph::graph(const llm_graph_params & params) :
 
     auto * inp_attn = build_attn_inp_kv_iswa();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // all tokens are output (single-token decode): the row selection of the last layer is the identity, skip it (the graph
+    // then depends on the number of outputs, which pipeline parallelism does not allow)
+    ggml_tensor * inp_out_ids = n_outputs < n_tokens || cparams.pipeline_parallel ? build_inp_out_ids() : nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;

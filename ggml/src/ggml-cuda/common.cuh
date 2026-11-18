@@ -1277,6 +1277,7 @@ struct ggml_cuda_device_info {
         size_t  total_vram;
         int     warp_size;                      // Number of threads in a dispatch
         bool    supports_cooperative_launch;    // whether cooperative launch is supported
+        size_t  l2_persist_max;                 // max. bytes of a persisting L2 access policy window (0: none)
         int     physical_device;                // backing physical CUDA device for this (virtual) device
         int     physical_share_count;           // number of (virtual) devices sharing this device's physical GPU
         int     virtual_index;                  // index of this (virtual) device among those sharing its physical GPU
@@ -1362,6 +1363,73 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph;
 struct ggml_cuda_stream_context;
 
+// atomic add without result that orders the prior writes of the thread (and of threads synchronized with it) before it
+static __device__ __forceinline__ void ggml_cuda_red_add_release(unsigned int * addr, unsigned int val) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(addr), "r"(val) : "memory");
+#else
+    __threadfence();
+    atomicAdd(addr, val);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+}
+
+// Copy of the last output of a graph (the logits of one token) to pinned host memory while the matmul that writes it
+// runs. A large copy of the last node in get_tensor_async is remembered; when the same tensor is written again by
+// mul_mat_vec_q (one column), the kernel counts its finished rows per chunk, and the next copy waits for each chunk on a
+// second stream and copies it, so that only the last chunk is copied after the kernel. Row r belongs to chunk
+// ~min(r, n-1-r)*n_chunks/((n+1)/2) (see chunk_of): the chunks fill from both ends of the output, as the row blocks of
+// an interleaved mul_mat_vec_q finish.
+struct ggml_cuda_d2h_overlap {
+    static constexpr int max_chunks = 32;
+
+    const void *   data     = nullptr; // the output (nullptr: none)
+    size_t         nbytes   = 0;
+    int            n_chunks = 0;
+    uint32_t       mul      = 0;       // see chunk_of
+    uint32_t       plan_id  = 0;       // changes with the output or the chunks: captured counting kernels are outdated
+    unsigned int * counters = nullptr; // finished rows per chunk, summed over the executions
+    uint32_t       rows[max_chunks];   // rows per chunk
+    size_t         range_off[max_chunks][2];
+    size_t         range_len[max_chunks][2];
+    uint32_t       launches = 0;       // executions of the counting kernel enqueued so far
+    uint32_t       captured = 0;       // counting kernels in the CUDA graph being captured
+    bool           pending  = false;   // the last evaluated graph ran the counting kernel
+    const ggml_tensor * last_node = nullptr; // the last node of the graph being evaluated
+    cudaStream_t   stream   = nullptr;
+    cudaEvent_t    done     = nullptr;
+
+    // multiplier of chunk_of for an output of n rows
+    static uint32_t chunk_mul(uint32_t n, uint32_t n_chunks) {
+        return (uint32_t) (((uint64_t) n_chunks << 32) / ((n + 1) / 2));
+    }
+
+    // chunk of row r of an output of n rows (the same integer math on the host and the device)
+    static __host__ __device__ __forceinline__ uint32_t chunk_of(uint32_t r, uint32_t n, uint32_t n_chunks, uint32_t mul) {
+        const uint32_t d = r < n - 1 - r ? r : n - 1 - r;
+        const uint32_t k = (uint32_t) (((uint64_t) d * mul) >> 32);
+        return k < n_chunks - 1 ? k : n_chunks - 1;
+    }
+
+    // the kernel writing t counts its rows for the copy
+    bool counts(const ggml_tensor * t) const {
+        return data != nullptr && t == last_node && t->data == data && ggml_nbytes(t) == nbytes;
+    }
+};
+
+// top-k of a single-token MoE router left to the next kernel that reads the expert ids (flint-fused.cu): the router wrote
+// only the logits; the first consumer computes the top-k (see ggml_cuda_flint_topk_flush)
+struct ggml_cuda_topk_deferred {
+    const void *  ids_src = nullptr; // data of the ids tensor, nullptr if nothing is deferred
+    const float * logits  = nullptr;
+    const float * bias    = nullptr;
+    int32_t *     ids     = nullptr;
+    float *       weights = nullptr;
+    int           n_used  = 0;
+    bool          norm    = false;
+    float         clamp   = 0.0f;
+    float         scale   = 1.0f;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1401,6 +1469,46 @@ struct ggml_backend_cuda_context {
     void q8_1_set(const ggml_tensor * t) {
         q8_1_cur ^= 1;
         q8_1_src  = t;
+    }
+
+    ggml_cuda_topk_deferred topk_deferred;
+
+    // weight whose start is kept in the persisting part of L2 (see ggml_cuda_mul_mat_vec_q)
+    const void * l2_persist = nullptr;
+
+    ggml_cuda_d2h_overlap d2h;
+    // small host to device copies of set_tensor_async, staged in pinned memory and sent with one batched copy before the
+    // next operation on the stream (decode inputs: positions, masks, cache indices)
+    char *                    h2d_stage      = nullptr;
+    size_t                    h2d_stage_used = 0;
+    cudaEvent_t               h2d_done       = nullptr; // the last batch has read the staging memory
+    std::vector<void *>       h2d_dsts;
+    std::vector<const void *> h2d_srcs;
+    std::vector<size_t>       h2d_sizes;
+
+    // zero-initialized scratch of single-token fused kernels (flint-fused.cu): counters that the last block resets
+    static constexpr size_t fused_scratch_size = 64 * 1024;
+    void * fused_scratch = nullptr;
+
+    void * get_fused_scratch() {
+        if (fused_scratch == nullptr) {
+            CUDA_CHECK(cudaMalloc(&fused_scratch, fused_scratch_size));
+            CUDA_CHECK(cudaMemset(fused_scratch, 0, fused_scratch_size));
+        }
+        return fused_scratch;
+    }
+
+    // the scratch can be used: allocated, or allocated now (not during a graph capture)
+    bool fused_scratch_ready() {
+        if (fused_scratch == nullptr) {
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(stream(), &status));
+            if (status != cudaStreamCaptureStatusNone) {
+                return false;
+            }
+            get_fused_scratch();
+        }
+        return true;
     }
 
     const void * q8_1_lookup(const ggml_tensor * t) const {
@@ -1525,6 +1633,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    bool interleave = false; // run the row blocks of both ends of the matrix in turn
+    unsigned int * progress = nullptr; // count the finished rows per chunk (see ggml_cuda_d2h_overlap)
+    uint32_t progress_nrows  = 0;
+    uint32_t progress_chunks = 0;
+    uint32_t progress_mul    = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

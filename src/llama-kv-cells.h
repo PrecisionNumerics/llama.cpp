@@ -180,11 +180,20 @@ public:
         return res;
     }
 
-    // copy the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
-    llama_kv_cells cp(const std::vector<uint32_t> & idxs) const {
-        llama_kv_cells res;
+    // the state of a list of cells (see cp() and set()), without the per-sequence data of a full llama_kv_cells
+    struct cells_state {
+        std::vector<llama_pos>         pos;
+        std::vector<llama_kv_cell_ext> ext;
+        std::vector<seq_set_t>         seq;
+    };
 
-        res.resize(idxs.size());
+    // copy the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
+    cells_state cp(const std::vector<uint32_t> & idxs) const {
+        cells_state res;
+
+        res.pos.resize(idxs.size());
+        res.ext.resize(idxs.size());
+        res.seq.resize(idxs.size());
 
         for (uint32_t j = 0; j < idxs.size(); ++j) {
             const auto idx = idxs[j];
@@ -231,7 +240,7 @@ public:
     }
 
     // set the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
-    void set(const std::vector<uint32_t> & idxs, const llama_kv_cells & other) {
+    void set(const std::vector<uint32_t> & idxs, const cells_state & other) {
         assert(idxs.size() == other.pos.size());
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {

@@ -31,6 +31,7 @@ struct ggml_cuda_graph_cluster {
 
 struct ggml_cuda_graph_instance {
     cudaGraphExec_t handle = nullptr;
+    uint32_t n_progress = 0; // kernels counting rows for ggml_cuda_d2h_overlap
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
     std::vector<ggml_cuda_graph_cluster> clusters;
 #endif
@@ -54,6 +55,7 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    uint32_t d2h_plan_id = 0; // ggml_cuda_d2h_overlap::plan_id at the capture
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
