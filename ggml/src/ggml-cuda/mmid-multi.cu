@@ -19,11 +19,17 @@
 
 #define MMID_MULTI_MAX_BATCH 32 // tokens up to which the single-kernel path is used (RTX 5090: MMQ wins from ~48)
 // single-token block shapes (RTX 5090): every grid fits in one wave
-#define MMID_GU_NW       32 // gate_up: warps per block, one row per warp (one q8_1 block of the down activations per block)
-#define MMID_GU_KSPLIT   1
-#define MMID_DOWN_NW     16
-#define MMID_DOWN_KSPLIT 4
-#define MMID_DOWN_RPW    2
+#define MMID_GU_NW        32 // gate_up: warps per block, one row per warp (one q8_1 block of the down activations per block)
+#define MMID_GU_KSPLIT    1
+#define MMID_GU_RPW_N     2  // gate_up from MMID_GU_RPW_N_MIN tokens: rows per warp, half the blocks (each has the latency
+#define MMID_GU_RPW_N_MIN 4  // of the top-k); with 2 and 3 tokens one row per warp is faster
+#define MMID_DOWN_NW      16
+#define MMID_DOWN_KSPLIT  4
+#define MMID_DOWN_RPW     2
+#define MMID_SUM_SPLIT    4 // partial sums of the weighted slot sum (see mul_mat_id_multi_vec)
+// down with several tokens: the blocks have MMID_DOWN_KSPLIT_N warps per row and the most rows (4 or 2 per warp) that
+// still give a block per SM: one wave of fewer blocks beats more waves (each block waits for its ids, weights, activations)
+#define MMID_DOWN_KSPLIT_N 2
 
 static constexpr bool mmid_multi_type_supported(ggml_type type) {
     switch (type) {
@@ -45,7 +51,7 @@ static constexpr bool mmid_multi_type_supported(ggml_type type) {
 //
 // PDL: the next kernel may launch at once; everything (ids, y, w) is read after the dependency wait.
 // rpw: rows per warp (rows_out must be a multiple of the rows of a block when rpw > 1)
-// yq_out: with QK8_1 rows per block (one per warp), also write dst as q8_1 (as quantize_q8_1; rows_out % QK8_1 == 0)
+// yq_out: with a multiple of QK8_1 rows per block, also write dst as q8_1 (as quantize_q8_1; rows_out % QK8_1 == 0)
 template <bool swiglu, bool sum_slots, int ksplit, int nwarps, int rpw = 1>
 static __global__ void __launch_bounds__(WARP_SIZE*nwarps) mul_mat_id_multi_vec(
         const mmid_multi_experts experts, const block_q8_1 * y, const int32_t * ids,
@@ -54,7 +60,6 @@ static __global__ void __launch_bounds__(WARP_SIZE*nwarps) mul_mat_id_multi_vec(
         const bool y_bcast, const int64_t ids_s1, const int64_t dst_s1, const int64_t dst_s2,
         const float * res, const int64_t res_s1, block_q8_1 * yq_out, const ggml_cuda_topk_deferred tk) {
     static_assert(nwarps % ksplit == 0, "ksplit must divide the warps of a block");
-    static_assert(rpw == 1 || !swiglu, "several rows per warp only without swiglu");
     constexpr int rows_per_block = nwarps / ksplit * rpw;
 
     const int lane = threadIdx.x;
@@ -97,35 +102,48 @@ static __global__ void __launch_bounds__(WARP_SIZE*nwarps) mul_mat_id_multi_vec(
 
     ggml_cuda_pdl_sync();
 
-    // deferred top-k of the router (one token): the blocks of the routed slots compute it, block (0, 0) writes the ids
-    // and weights for the next kernels
+    const int32_t * ids_t = ids + t * ids_s1; // the expert ids of the token
+
+    // deferred top-k of the router: the blocks of the routed slots of a token compute it, block (0, slot 0) of the token
+    // writes its ids and weights for the next kernels
     if constexpr (swiglu && !sum_slots) {
         if (tk.logits && s_begin < n_used) {
             static_assert(!swiglu || sum_slots || WARP_SIZE * nwarps >= FLINT_NEXPERT, "flint_topk_block needs FLINT_NEXPERT threads");
             __shared__ int32_t ids_s[FLINT_MAX_USED];
             __shared__ float   w_s[FLINT_MAX_USED];
-            // only the ids are needed here: block (0, 0) normalizes the weights after the selection
-            flint_topk_select(tk.logits, tk_bias, n_used, ids_s, w_s);
-            if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.y == 0) {
+            // only the ids are needed here: one block per token normalizes the weights after the selection
+            flint_topk_select(tk.logits + t * FLINT_NEXPERT, tk_bias, n_used, ids_s, w_s);
+            if (blockIdx.x == 0 && s_begin == 0 && threadIdx.y == 0) {
                 const float wt = flint_topk_weight(ids_s, w_s, n_used, tk.norm, tk.clamp, tk.scale, lane);
                 if (lane < n_used) {
-                    tk.ids[lane]     = ids_s[lane];
-                    tk.weights[lane] = wt;
+                    tk.ids[t * tk.ids_s1 + lane]   = ids_s[lane];
+                    tk.weights[t * tk.w_s1 + lane] = wt;
                 }
             }
-            ids = ids_s;
+            ids_t = ids_s;
         }
     }
 
-    float acc[rpw];
-    float acc_up = 0.0f;
+    // the weighted slot sum is split into MMID_SUM_SPLIT interleaved partial sums (slot s to sum s % MMID_SUM_SPLIT), each
+    // reduced over the lanes, then added in order: the same result for any ksplit and block shape (batch invariance). Warp
+    // ks keeps the nacc sums ks + a*ksplit.
+    constexpr int nacc = sum_slots ? MMID_SUM_SPLIT / ksplit : 1;
+    constexpr int nps  = ksplit * nacc; // partial sums per row
+    static_assert(!sum_slots || MMID_SUM_SPLIT % ksplit == 0, "ksplit must divide MMID_SUM_SPLIT");
+    float acc[nacc][rpw];
+    float acc_up[rpw];
 #pragma unroll
     for (int r = 0; r < rpw; ++r) {
-        acc[r] = 0.0f;
+#pragma unroll
+        for (int a = 0; a < nacc; ++a) {
+            acc[a][r] = 0.0f;
+        }
+        acc_up[r] = 0.0f;
     }
-    for (int s = s_begin; row < rows_out && s < s_end; s += s_step) {
+    // ia: the partial sum of slot s
+    for (int s = s_begin, ia = 0; row < rows_out && s < s_end; s += s_step, ia = ia + 1 == nacc ? 0 : ia + 1) {
         int g;
-        const char * xe = mmid_multi_slot_expert(experts, ids, s, t, n_used, ids_s1, g);
+        const char * xe = mmid_multi_slot_expert(experts, ids_t, s, n_used, g);
         if (!xe) {
             continue; // skipped slot
         }
@@ -133,68 +151,84 @@ static __global__ void __launch_bounds__(WARP_SIZE*nwarps) mul_mat_id_multi_vec(
         const int64_t      nb1 = experts.nb1[g];
 
         float dot[rpw];
-        float dot_up = 0.0f;
+        float dot_up[rpw];
         if constexpr (rpw == 1) {
             switch (experts.type[g]) {
-                case GGML_TYPE_Q1_0: mmid_multi_rows_dot<GGML_TYPE_Q1_0>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot[0], dot_up, swiglu); break;
-                case GGML_TYPE_Q2_0: mmid_multi_rows_dot<GGML_TYPE_Q2_0>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot[0], dot_up, swiglu); break;
-                case GGML_TYPE_Q4_0: mmid_multi_rows_dot<GGML_TYPE_Q4_0>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot[0], dot_up, swiglu); break;
-                default:             mmid_multi_rows_dot<GGML_TYPE_Q8_0>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot[0], dot_up, swiglu); break;
+                case GGML_TYPE_Q1_0: mmid_multi_rows_dot<GGML_TYPE_Q1_0>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot[0], dot_up[0], swiglu); break;
+                case GGML_TYPE_Q2_0: mmid_multi_rows_dot<GGML_TYPE_Q2_0>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot[0], dot_up[0], swiglu); break;
+                case GGML_TYPE_Q4_0: mmid_multi_rows_dot<GGML_TYPE_Q4_0>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot[0], dot_up[0], swiglu); break;
+                default:             mmid_multi_rows_dot<GGML_TYPE_Q8_0>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot[0], dot_up[0], swiglu); break;
             }
         } else {
             switch (experts.type[g]) {
-                case GGML_TYPE_Q1_0: mmid_multi_rows_dot_n<GGML_TYPE_Q1_0, rpw>(xe, nb1, ys, ncols, item0, istep, row, dot); break;
-                case GGML_TYPE_Q2_0: mmid_multi_rows_dot_n<GGML_TYPE_Q2_0, rpw>(xe, nb1, ys, ncols, item0, istep, row, dot); break;
-                case GGML_TYPE_Q4_0: mmid_multi_rows_dot_n<GGML_TYPE_Q4_0, rpw>(xe, nb1, ys, ncols, item0, istep, row, dot); break;
-                default:             mmid_multi_rows_dot_n<GGML_TYPE_Q8_0, rpw>(xe, nb1, ys, ncols, item0, istep, row, dot); break;
+                case GGML_TYPE_Q1_0: mmid_multi_rows_dot_n<GGML_TYPE_Q1_0, rpw>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot, dot_up, swiglu); break;
+                case GGML_TYPE_Q2_0: mmid_multi_rows_dot_n<GGML_TYPE_Q2_0, rpw>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot, dot_up, swiglu); break;
+                case GGML_TYPE_Q4_0: mmid_multi_rows_dot_n<GGML_TYPE_Q4_0, rpw>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot, dot_up, swiglu); break;
+                default:             mmid_multi_rows_dot_n<GGML_TYPE_Q8_0, rpw>(xe, nb1, ys, ncols, item0, istep, row, row + rows_out, dot, dot_up, swiglu); break;
             }
         }
         // the slot sum is linear, so the lanes' partial sums are weighted before the reduction
         const float ws = sum_slots && s < n_used ? w[s + t * n_used] : 1.0f;
 #pragma unroll
         for (int r = 0; r < rpw; ++r) {
-            acc[r] += sum_slots && s < n_used ? ws * dot[r] : dot[r];
+#pragma unroll
+            for (int a = 0; a < nacc; ++a) {
+                if (a == ia) { // no dynamic register indexing
+                    acc[a][r] += sum_slots && s < n_used ? ws * dot[r] : dot[r];
+                }
+            }
+            acc_up[r] += dot_up[r];
         }
-        acc_up += dot_up;
     }
 
 #pragma unroll
     for (int r = 0; r < rpw; ++r) {
-        acc[r] = warp_reduce_sum(acc[r]);
-    }
-    if (swiglu) {
-        acc_up = warp_reduce_sum(acc_up);
+#pragma unroll
+        for (int a = 0; a < nacc; ++a) {
+            acc[a][r] = warp_reduce_sum(acc[a][r]);
+        }
+        if (swiglu) {
+            acc_up[r] = warp_reduce_sum(acc_up[r]);
+        }
     }
     bool writer = lane == 0 && row < rows_out;
-    if constexpr (ksplit > 1) {
-        __shared__ float part[nwarps][rpw];
-        __shared__ float part_up[nwarps];
+    if constexpr (nps > 1) {
+        const int rg = threadIdx.y / ksplit; // row group
+        __shared__ float part[nwarps / ksplit][nps][rpw];
+        __shared__ float part_up[swiglu ? nwarps / ksplit : 1][ksplit][rpw];
         if (lane == 0) {
 #pragma unroll
             for (int r = 0; r < rpw; ++r) {
-                part[threadIdx.y][r] = acc[r];
+#pragma unroll
+                for (int a = 0; a < nacc; ++a) {
+                    part[rg][ks + a * ksplit][r] = acc[a][r];
+                }
+                if (swiglu) {
+                    part_up[rg][ks][r] = acc_up[r];
+                }
             }
-            part_up[threadIdx.y] = acc_up;
         }
         __syncthreads();
         writer = writer && ks == 0;
         if (ks == 0) {
 #pragma unroll
-            for (int k = 1; k < ksplit; ++k) {
+            for (int k = 1; k < nps; ++k) {
 #pragma unroll
                 for (int r = 0; r < rpw; ++r) {
-                    acc[r] += part[threadIdx.y + k][r];
+                    acc[0][r] += part[rg][k][r];
+                    if (swiglu && k < ksplit) {
+                        acc_up[r] += part_up[rg][k][r];
+                    }
                 }
-                acc_up += part_up[threadIdx.y + k];
             }
         }
     }
-    float out_q = 0.0f;
+    float out_q[rpw] = {};
     if (writer) {
 #pragma unroll
         for (int r = 0; r < rpw; ++r) {
-            const float out = swiglu ? ggml_cuda_op_silu_single(acc[r]) * acc_up : acc[r];
-            out_q = out;
+            const float out = swiglu ? ggml_cuda_op_silu_single(acc[0][r]) * acc_up[r] : acc[0][r];
+            out_q[r] = out;
             if (sum_slots) {
                 // res: a fused residual add (may alias dst: this thread reads it before the write)
                 dst[row + r + t * dst_s1] = res ? out + res[row + r + t * res_s1] : out;
@@ -204,20 +238,25 @@ static __global__ void __launch_bounds__(WARP_SIZE*nwarps) mul_mat_id_multi_vec(
         }
     }
 
-    if constexpr (!sum_slots && rows_per_block == QK8_1 && ksplit == 1 && rpw == 1) {
+    if constexpr (!sum_slots && rows_per_block % QK8_1 == 0 && ksplit == 1) {
         if (yq_out) {
-            __shared__ float q_s[QK8_1];
+            __shared__ float q_s[rows_per_block];
             if (lane == 0) {
-                q_s[threadIdx.y] = out_q;
+#pragma unroll
+                for (int r = 0; r < rpw; ++r) {
+                    q_s[threadIdx.y * rpw + r] = out_q[r];
+                }
             }
             __syncthreads();
-            if (threadIdx.y == 0) {
-                const float  xi   = q_s[lane];
+            // warp i quantizes the rows [QK8_1*i, QK8_1*i + QK8_1) of the block
+            if (threadIdx.y < rows_per_block / QK8_1) {
+                const float  xi   = q_s[threadIdx.y * QK8_1 + lane];
                 const float  amax = warp_reduce_max<QK8_1>(fabsf(xi));
                 const float  d    = amax / 127.0f;
                 const int8_t q    = amax == 0.0f ? 0 : roundf(xi / d);
                 const int    sum  = warp_reduce_sum<QK8_1>((int) q);
-                block_q8_1 & yb = yq_out[(s_begin + (int64_t) t * n_slots) * (rows_out / QK8_1) + blockIdx.x];
+                block_q8_1 & yb = yq_out[(s_begin + (int64_t) t * n_slots) * (rows_out / QK8_1) +
+                    blockIdx.x * (rows_per_block / QK8_1) + threadIdx.y];
                 yb.qs[lane] = q;
                 if (lane == 0) {
                     yb.ds = make_half2(d, d * sum);
@@ -344,8 +383,7 @@ static __device__ __forceinline__ void mmid_grouped_load_chunk(const char * __re
     }
 }
 
-// token range of the grouped path
-#define MMID_GROUPED_MIN_TOKENS 4
+// token range of the grouped path (MMID_GROUPED_MIN_TOKENS: mmid-multi.cuh)
 #define MMID_GROUPED_MAX_TOKENS 8192
 
 struct mmid_grouped_seg {
@@ -996,10 +1034,11 @@ void ggml_cuda_mul_mat_id_multi(ggml_backend_cuda_context & ctx, ggml_tensor * d
         vec_ok = vec_ok && (t == GGML_TYPE_Q1_0 || t == GGML_TYPE_Q2_0 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q8_0);
     }
 
-    // a deferred router top-k (see ggml_cuda_topk_deferred) is computed by the single-token gate_up kernel, else first
+    // a deferred router top-k (see ggml_cuda_topk_deferred) is computed by the gate_up kernel, else first
     ggml_cuda_topk_deferred tk = {};
     if (ctx.topk_deferred.ids_src) {
-        if (ctx.topk_deferred.ids_src == ids->data && vec_ok && swiglu && n_tokens == 1 && n_used == ctx.topk_deferred.n_used &&
+        if (ctx.topk_deferred.ids_src == ids->data && vec_ok && swiglu && n_tokens == ctx.topk_deferred.n_tokens &&
+                n_used == ctx.topk_deferred.n_used && ids_s1 == ctx.topk_deferred.ids_s1 &&
                 MMID_GU_NW * WARP_SIZE >= FLINT_NEXPERT &&
                 n_tokens <= MMID_MULTI_MAX_BATCH && n_tokens < MMID_GROUPED_MIN_TOKENS) {
             tk = ctx.topk_deferred;
@@ -1030,19 +1069,30 @@ void ggml_cuda_mul_mat_id_multi(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const int64_t n_pairs  = n_rout + n_sh * n_tokens;
         const int64_t max_segs = std::min<int64_t>(n_routed, n_rout) + n_rout / MMID_GROUPED_SEG +
                                  n_sh * ((n_tokens + MMID_GROUPED_SEG - 1) / MMID_GROUPED_SEG) + 2;
-        ggml_cuda_pool_alloc<int>              pairs(ctx.pool(), n_pairs);
-        ggml_cuda_pool_alloc<mmid_grouped_seg> segs(ctx.pool(), max_segs);
-        ggml_cuda_pool_alloc<int>              n_segs(ctx.pool(), 1);
-        int              * pairs_p  = pairs.get();
-        mmid_grouped_seg * segs_p   = segs.get();
-        int              * n_segs_p = n_segs.get();
-        ggml_cuda_kernel_launch(mmid_grouped_sort, ggml_cuda_kernel_launch_params(dim3(1), dim3(1024), 0, stream),
-            (const int32_t *) ids->data, ids_s1, (int) n_used, n_sh, (int) n_tokens, n_routed, pairs_p, segs_p, n_segs_p);
+
+        // the segments go to the fused scratch when they fit (small batches): the next op with the same ids reuses them
+        constexpr size_t scratch_offs = ggml_backend_cuda_context::fused_scratch_mmid_offset;
+        constexpr size_t scratch_size = ggml_backend_cuda_context::fused_scratch_size - scratch_offs;
+        const size_t segs_size = GGML_PAD(max_segs * sizeof(mmid_grouped_seg), 16);
+        const size_t sort_size = sizeof(int4) + segs_size + n_pairs * sizeof(int); // n_segs (padded), segs, pairs
+        const bool   in_scratch = sort_size <= scratch_size && ctx.curr_stream_no == 0 && ctx.fused_scratch_ready();
+        const ggml_backend_cuda_context::mmid_sort_key key = { ids, n_sh, n_routed };
+        const bool   sorted     = in_scratch && ctx.mmid_sorted == key;
+        ggml_cuda_pool_alloc<char> sort_buf(ctx.pool());
+        char * sort_p = in_scratch ? (char *) ctx.get_fused_scratch() + scratch_offs : sort_buf.alloc(sort_size);
+        int              * n_segs_p = (int *) sort_p;
+        mmid_grouped_seg * segs_p   = (mmid_grouped_seg *) (sort_p + sizeof(int4));
+        int              * pairs_p  = (int *) (sort_p + sizeof(int4) + segs_size);
+        if (!sorted) {
+            ggml_cuda_kernel_launch(mmid_grouped_sort, ggml_cuda_kernel_launch_params(dim3(1), dim3(1024), 0, stream),
+                (const int32_t *) ids->data, ids_s1, (int) n_used, n_sh, (int) n_tokens, n_routed, pairs_p, segs_p, n_segs_p);
+        }
+        ctx.mmid_sorted = in_scratch ? key : ggml_backend_cuda_context::mmid_sort_key();
 
         // the weighted sum over slots goes through tmp [rows, n_slots, n_tokens]
         const bool weighted = !swiglu && w;
-        ggml_cuda_pool_alloc<float> tmp(ctx.pool(), weighted ? rows * n_slots * n_tokens : 0);
-        float * out = weighted ? tmp.get() : (float *) dst->data;
+        ggml_cuda_pool_alloc<float> tmp(ctx.pool());
+        float * out = weighted ? tmp.alloc(rows * n_slots * n_tokens) : (float *) dst->data;
         const int64_t out_s1 = weighted ? rows : dst->nb[1] / sizeof(float);
         const int64_t out_s2 = weighted ? rows * n_slots : dst->nb[2] / sizeof(float);
         const bool y_bcast = b->ne[1] == 1;
@@ -1132,22 +1182,35 @@ void ggml_cuda_mul_mat_id_multi(ggml_backend_cuda_context & ctx, ggml_tensor * d
         if (swiglu) {
             // one q8_1 block per block of the kernel: also write the q8_1 activations of the down projection (unpadded rows only, as the down lookup needs)
             constexpr bool gu_q8_1 = MMID_GU_NW / MMID_GU_KSPLIT == QK8_1;
-            const bool yq_out_ok = gu_q8_1 && rows_out % MATRIX_ROW_PADDING == 0 && rows_out <= ggml_backend_cuda_context::q8_1_max_ncols &&
-                n_slots * n_tokens <= ggml_backend_cuda_context::q8_1_max_rows && ggml_is_contiguous(dst) &&
+            const bool yq_out_ok = gu_q8_1 && rows_out % MATRIX_ROW_PADDING == 0 &&
+                ggml_backend_cuda_context::q8_1_fits(n_slots * n_tokens, rows_out) && ggml_is_contiguous(dst) &&
                 dst_s1 == rows_out && dst_s2 == rows_out * n_slots && ctx.curr_stream_no == 0;
-            if (yq_out_ok) {
-                block_q8_1 * yq_out = (block_q8_1 *) ctx.q8_1_next_buf();
-                mmid_multi_vec_launch<true, false, MMID_GU_KSPLIT, MMID_GU_NW>(experts, yq, idd, wd, dd,
+            block_q8_1 * yq_out = yq_out_ok ? (block_q8_1 *) ctx.q8_1_next_buf() : nullptr;
+            if (n_tokens >= MMID_GU_RPW_N_MIN && rows_out % (MMID_GU_NW / MMID_GU_KSPLIT * MMID_GU_RPW_N) == 0) {
+                mmid_multi_vec_launch<true, false, MMID_GU_KSPLIT, MMID_GU_NW, MMID_GU_RPW_N>(experts, yq, idd, wd, dd,
                     ncols, rows_out, n_used, n_slots, n_tokens, y_row_blocks, y_bcast, ids_s1, dst_s1, dst_s2, res_d, res_s1,
                     stream, yq_out, tk);
-                ctx.q8_1_set(dst);
             } else {
                 mmid_multi_vec_launch<true, false, MMID_GU_KSPLIT, MMID_GU_NW>(experts, yq, idd, wd, dd,
                     ncols, rows_out, n_used, n_slots, n_tokens, y_row_blocks, y_bcast, ids_s1, dst_s1, dst_s2, res_d, res_s1,
-                    stream, nullptr, tk);
+                    stream, yq_out, tk);
+            }
+            if (yq_out) {
+                ctx.q8_1_set(dst);
             }
         } else if (w && rows_out % (MMID_DOWN_NW / MMID_DOWN_KSPLIT * MMID_DOWN_RPW) == 0) {
-            MMID_MULTI_LAUNCH(false, true, MMID_DOWN_KSPLIT, MMID_DOWN_NW, MMID_DOWN_RPW);
+            const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+            const auto fills_sms = [&](const int rpw) {
+                const int rows = MMID_DOWN_NW / MMID_DOWN_KSPLIT_N * rpw;
+                return n_tokens > 1 && rows_out % rows == 0 && n_tokens * (rows_out / rows) >= nsm;
+            };
+            if (fills_sms(4)) {
+                MMID_MULTI_LAUNCH(false, true, MMID_DOWN_KSPLIT_N, MMID_DOWN_NW, 4);
+            } else if (fills_sms(2)) {
+                MMID_MULTI_LAUNCH(false, true, MMID_DOWN_KSPLIT_N, MMID_DOWN_NW, 2);
+            } else {
+                MMID_MULTI_LAUNCH(false, true, MMID_DOWN_KSPLIT, MMID_DOWN_NW, MMID_DOWN_RPW);
+            }
         } else if (w) {
             MMID_MULTI_LAUNCH(false, true, 2, 4);
         } else {

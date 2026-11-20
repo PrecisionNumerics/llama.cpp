@@ -10,6 +10,11 @@ bool ggml_cuda_mul_mat_id_multi_supported(const ggml_tensor * op);
 void ggml_cuda_mul_mat_id_multi(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * res = nullptr,
         ggml_tensor * add_dst = nullptr);
 
+// tokens from which the experts are grouped (their weights are read once for all tokens); fewer tokens: per-token kernels,
+// which also take a deferred router top-k (ggml_cuda_topk_deferred). With 8 tokens the 48 pairs of 6 routed slots hit ~44
+// experts, too few shared ones for the grouped kernels to win.
+#define MMID_GROUPED_MIN_TOKENS 9
+
 // whether the weighted op `node` can write add_dst = node + res directly (see ggml_cuda_mul_mat_id_multi)
 bool ggml_cuda_mul_mat_id_multi_can_fuse_add(const ggml_tensor * node, const ggml_tensor * res, const ggml_tensor * add_dst);
 
@@ -112,10 +117,12 @@ static __device__ __forceinline__ void mmid_multi_rows_dot(
     }
 }
 
-// partial dot products of rows row .. row + rpw - 1 of x (type) and one q8_1 row of y, loads of all rows in flight together
+// partial dot products of rows row .. row + rpw - 1 of x (type) and one q8_1 row of y, loads of all rows in flight together;
+// swiglu: also of the up rows row_up .. row_up + rpw - 1
 template <ggml_type type, int rpw>
 static __device__ __forceinline__ void mmid_multi_rows_dot_n(const char * xe, const int64_t nb1, const block_q8_1 * y,
-        const int ncols, const int item0, const int istep, const int row, float * dot) {
+        const int ncols, const int item0, const int istep, const int row, const int row_up, float * dot, float * dot_up,
+        const bool swiglu) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     constexpr int qi = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr =
@@ -133,7 +140,8 @@ static __device__ __forceinline__ void mmid_multi_rows_dot_n(const char * xe, co
     const int n_items = (ncols / qk) * items_per_block;
 #pragma unroll
     for (int r = 0; r < rpw; ++r) {
-        dot[r] = 0.0f;
+        dot[r]    = 0.0f;
+        dot_up[r] = 0.0f;
     }
     for (int item = item0; item < n_items; item += istep) {
         const int kbx = item / items_per_block;
@@ -141,16 +149,19 @@ static __device__ __forceinline__ void mmid_multi_rows_dot_n(const char * xe, co
 #pragma unroll
         for (int r = 0; r < rpw; ++r) {
             dot[r] += vec_dot(xe + (row + r) * nb1, &y[kbx * (qk / QK8_1)], kbx, kqs);
+            if (swiglu) {
+                dot_up[r] += vec_dot(xe + (row_up + r) * nb1, &y[kbx * (qk / QK8_1)], kbx, kqs);
+            }
         }
     }
 }
 
-// expert data of slot s of token t and its tensor index g, or nullptr for a skipped slot
+// expert data of slot s of a token (ids: its expert ids) and its tensor index g, or nullptr for a skipped slot
 static __device__ __forceinline__ const char * mmid_multi_slot_expert(const mmid_multi_experts & experts,
-        const int32_t * ids, const int s, const int t, const int n_used, const int64_t ids_s1, int & g) {
+        const int32_t * ids, const int s, const int n_used, int & g) {
     int e;
     if (s < n_used) {
-        const int id = ids[s + t * ids_s1];
+        const int id = ids[s];
         if (id < 0 || id >= experts.first[experts.n_as]) {
             return nullptr;
         }

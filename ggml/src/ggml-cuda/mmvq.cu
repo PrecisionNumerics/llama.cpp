@@ -1523,7 +1523,7 @@ static void mul_mat_vec_q_switch_type(
 static bool ggml_cuda_mmvq_l2_persist(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids) {
     static const bool disabled = getenv("GGML_CUDA_NO_L2_PERSIST") != nullptr;
     const size_t max_bytes = ggml_cuda_info().devices[ctx.device].l2_persist_max;
-    if (disabled || ids || max_bytes == 0 || !src0->buffer || ggml_nbytes(src0) <= max_bytes ||
+    if (disabled || !ctx.l2_persist_on || ids || max_bytes == 0 || !src0->buffer || ggml_nbytes(src0) <= max_bytes ||
             ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         return false;
     }
@@ -1531,6 +1531,7 @@ static bool ggml_cuda_mmvq_l2_persist(ggml_backend_cuda_context & ctx, const ggm
         CUDA_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, max_bytes));
         ctx.l2_persist = src0->data;
     }
+    ctx.l2_resident = ctx.l2_resident || ctx.l2_persist == src0->data;
     return ctx.l2_persist == src0->data;
 }
 

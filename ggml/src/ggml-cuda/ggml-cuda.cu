@@ -4621,7 +4621,21 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
-// Q/K norm (+ rope), K/V cache writes and single-token flash attention of one layer, see ggml_cuda_flint_attn
+// MUL_MAT -> ADD that few-row MMQ fuses (the residual is added to its result): as ggml_cuda_mul_mat takes it, no broadcast
+static bool ggml_cuda_mul_mat_q_few_add_supported(const ggml_tensor * mm, const ggml_tensor * add) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const ggml_tensor * res  = add->src[0] == mm ? add->src[1] : add->src[0];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    return ggml_is_quantized(src0->type) && !bad_padding_clear && !ggml_cuda_op_mul_mat_use_fwht(mm) &&
+        src1->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 && ggml_cuda_should_use_mmq_few(src0, src1, cc) &&
+        mm->ne[2] == 1 && mm->ne[3] == 1 && add->type == GGML_TYPE_F32 && ggml_are_same_shape(add, mm) &&
+        res->type == GGML_TYPE_F32 && ggml_are_same_shape(res, mm) && res->nb[0] == sizeof(float) && add->nb[0] == sizeof(float);
+}
+
+// Q/K norm (+ rope), K/V cache writes and flash attention of up to FLINT_ATTN_MAX_TOKENS tokens of one layer, see ggml_cuda_flint_attn
 static bool ggml_cuda_match_flint_attn(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
         ggml_cuda_flint_attn_args & a, int & fa_idx) {
     const auto N = [&](const int k) -> ggml_tensor * { return k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr; };
@@ -4630,7 +4644,8 @@ static bool ggml_cuda_match_flint_attn(ggml_backend_cuda_context * cuda_ctx, con
     int k = i;
     ggml_tensor * qn = N(k++);
     ggml_tensor * qm = N(k++);
-    if (!is(qn, GGML_OP_RMS_NORM) || !is(qm, GGML_OP_MUL) || qm->src[0] != qn || qn->ne[1] < 2) {
+    if (!is(qn, GGML_OP_RMS_NORM) || !is(qm, GGML_OP_MUL) || qm->src[0] != qn || qn->ne[1] < 2 ||
+            qn->ne[2]*qn->ne[3] > FLINT_ATTN_MAX_TOKENS) {
         return false;
     }
     ggml_tensor * qr = is(N(k), GGML_OP_ROPE) && N(k)->src[0] == qm ? N(k++) : nullptr;
@@ -4715,7 +4730,22 @@ static bool ggml_cuda_match_flint_attn(ggml_backend_cuda_context * cuda_ctx, con
     a.v_set    = v_set;
     a.fa       = fa;
     ggml_tensor * out = N(fa_idx + 1);
-    a.fa_2d    = is(out, GGML_OP_RESHAPE) && out->src[0] == fa && out->ne[1] == 1 && ggml_is_contiguous(out) ? out : nullptr;
+    a.fa_2d    = is(out, GGML_OP_RESHAPE) && out->src[0] == fa && out->ne[0] == fa->ne[0]*fa->ne[1] && ggml_nrows(out) == ggml_nrows(fa)/fa->ne[1] && ggml_is_contiguous(out) ? out : nullptr;
+    // with several tokens the output may overwrite Q/K/V rows other blocks still read (dst reuses their memory): it is
+    // left out when its only reader is a fused MUL_MAT -> ADD that takes the q8_1 copy (flint_mmvq_add, few-row MMQ)
+    a.f32_out  = true;
+    ggml_tensor * mm  = N(fa_idx + 2);
+    ggml_tensor * add = N(fa_idx + 3);
+    if (a.fa_2d && qn->ne[2]*qn->ne[3] > 1 && is(mm, GGML_OP_MUL_MAT) && mm->src[1] == a.fa_2d && is(add, GGML_OP_ADD) &&
+            (add->src[0] == mm || add->src[1] == mm) && add->src[0] != add->src[1] &&
+            ggml_node_get_use_count(cgraph, fa_idx) == 1 && ggml_node_get_use_count(cgraph, fa_idx + 1) == 1 &&
+            !(fa->flags & GGML_TENSOR_FLAG_OUTPUT) && !(out->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            (ggml_cuda_flint_mmvq_add_supported(*cuda_ctx, mm, add) ||
+             (ggml_cuda_mul_mat_q_few_add_supported(mm, add) && ggml_cuda_mul_mat_q_few_q8_1_ok(mm->src[0], mm->src[1])))) {
+        const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+        const int out_nodes[] = { fa_idx + 3 };
+        a.f32_out = !ggml_can_fuse_subgraph(cgraph, fa_idx + 2, 2, ops, out_nodes, 1);
+    }
     return true;
 }
 
@@ -4808,7 +4838,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // Flint router: rms_norm -> mul -> mul_mat (BF16) -> sigmoid -> bias -> top-k -> norm, one token
+    // Flint router: rms_norm -> mul -> mul_mat (BF16) -> sigmoid -> bias -> top-k -> norm, up to FR_MAX_TOKENS tokens
     if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes && cuda_ctx->curr_stream_no == 0 &&
             cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT &&
             cgraph->nodes[i + 3]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 3]) == GGML_UNARY_OP_SIGMOID) {
@@ -4839,9 +4869,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ra.norm    = args.norm;
             ra.clamp   = args.norm ? ggml_get_op_params_f32(cgraph->nodes[i + 11], 0) : -INFINITY;
             ra.scale   = args.scale ? ggml_get_op_params_f32(cgraph->nodes[i + n_ops - 1], 0) : 1.0f;
-            // the top-k can be left to the expert matmul that follows (after views of other tensors)
+            // the top-k can be left to the expert matmul that follows (after views of other tensors), which takes it for
+            // fewer than MMID_GROUPED_MIN_TOKENS tokens
             ra.defer   = false;
-            for (int j = i + n_ops; j < cgraph->n_nodes; ++j) {
+            for (int j = i + n_ops; ra.ids->ne[1] < MMID_GROUPED_MIN_TOKENS && j < cgraph->n_nodes; ++j) {
                 const ggml_tensor * nj = cgraph->nodes[j];
                 if (nj->op == GGML_OP_MUL_MAT_ID_MULTI) {
                     ra.defer = nj->src[ggml_get_op_params_i32(nj, 0) + 1] == ra.ids;
@@ -4859,7 +4890,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // MUL_MAT (activations in the q8_1 cache) -> ADD of one token
+    // MUL_MAT (activations in the q8_1 cache) -> ADD: flint_mmvq_add up to FLINT_MAX_TOKENS tokens, few-row MMQ for more
     if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes && cuda_ctx->curr_stream_no == 0 &&
             cgraph->nodes[i + 1]->op == GGML_OP_ADD &&
             (cgraph->nodes[i + 1]->src[0] == node || cgraph->nodes[i + 1]->src[1] == node)) {
@@ -4871,9 +4902,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_flint_mmvq_add(*cuda_ctx, node, add);
             return 1;
         }
+        if (add->src[0] != add->src[1] && ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1) &&
+                ggml_cuda_mul_mat_q_few_add_supported(node, add)) {
+            // the q8_1 copy is used if there is one (the output of flint_attn may have no F32 data)
+            const void * y_q8_1 = ggml_cuda_mul_mat_q_few_q8_1_ok(node->src[0], node->src[1]) ? cuda_ctx->q8_1_lookup(node->src[1]) : nullptr;
+            ggml_cuda_mul_mat_q_few(*cuda_ctx, node->src[0], node->src[1], add, add->src[0] == node ? add->src[1] : add->src[0], y_q8_1);
+            return 1;
+        }
     }
 
-    // RMS_NORM -> MUL -> MUL_MAT of one token
+    // RMS_NORM -> MUL -> MUL_MAT of up to FLINT_MAX_TOKENS tokens
     if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes && cuda_ctx->curr_stream_no == 0 &&
             cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT) {
         const ggml_tensor * mul = cgraph->nodes[i + 1];
@@ -4888,7 +4926,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // RMS_NORM -> MUL -> MUL_MAT, MUL_MAT -> GLU (dense FFN gate/up) of one token
+    // RMS_NORM -> MUL -> MUL_MAT, MUL_MAT -> GLU (dense FFN gate/up) of up to FLINT_MAX_TOKENS tokens
     if (node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes && cuda_ctx->curr_stream_no == 0 &&
             cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT &&
             cgraph->nodes[i + 3]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 4]->op == GGML_OP_GLU) {
@@ -5928,14 +5966,34 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// The persisting L2 window of ggml_cuda_mul_mat_vec_q pays off only in graphs that are bound by reading the weights once
+// (decode of up to FLINT_MAX_TOKENS tokens); in larger graphs the persisting lines would take L2 from the other kernels.
+static void ggml_cuda_l2_persist_begin(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph) {
+    int64_t n_tokens = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT) {
+            n_tokens = ggml_nrows(node->src[1]);
+            break;
+        }
+    }
+    ctx->l2_persist_on = n_tokens <= FLINT_MAX_TOKENS;
+    if (!ctx->l2_persist_on && ctx->l2_resident) {
+        CUDA_CHECK(cudaCtxResetPersistingL2Cache());
+        ctx->l2_resident = false;
+    }
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_h2d_flush(cuda_ctx);
 
     ggml_cuda_set_device(cuda_ctx->device);
-    cuda_ctx->q8_1_src = nullptr;
+    cuda_ctx->q8_1_src    = nullptr;
+    cuda_ctx->mmid_sorted = {};
     cuda_ctx->d2h.pending   = false;
     cuda_ctx->d2h.last_node = cgraph->n_nodes > 0 ? cgraph->nodes[cgraph->n_nodes - 1] : nullptr;
+    ggml_cuda_l2_persist_begin(cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

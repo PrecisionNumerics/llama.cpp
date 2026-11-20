@@ -1373,6 +1373,34 @@ static __device__ __forceinline__ void ggml_cuda_red_add_release(unsigned int * 
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 }
 
+// load that orders the later reads of the thread (and of threads synchronized with it) after it (pairs with a release)
+static __device__ __forceinline__ unsigned int ggml_cuda_ld_acquire(const unsigned int * addr) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    unsigned int val;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(val) : "l"(addr) : "memory");
+    return val;
+#else
+    const unsigned int val = *(const volatile unsigned int *) addr;
+    __threadfence();
+    return val;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+}
+
+// atomic add (returns the old value) that orders the prior writes of the thread (and of threads synchronized with it) before
+// it and the later reads after it
+static __device__ __forceinline__ unsigned int ggml_cuda_atom_add_acq_rel(unsigned int * addr, unsigned int val) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    unsigned int old;
+    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(addr), "r"(val) : "memory");
+    return old;
+#else
+    __threadfence();
+    const unsigned int old = atomicAdd(addr, val);
+    __threadfence();
+    return old;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+}
+
 // Copy of the last output of a graph (the logits of one token) to pinned host memory while the matmul that writes it
 // runs. A large copy of the last node in get_tensor_async is remembered; when the same tensor is written again by
 // mul_mat_vec_q (one column), the kernel counts its finished rows per chunk, and the next copy waits for each chunk on a
@@ -1416,15 +1444,18 @@ struct ggml_cuda_d2h_overlap {
     }
 };
 
-// top-k of a single-token MoE router left to the next kernel that reads the expert ids (flint-fused.cu): the router wrote
-// only the logits; the first consumer computes the top-k (see ggml_cuda_flint_topk_flush)
+// top-k of a MoE router left to the next kernel that reads the expert ids (flint-fused.cu): the router wrote only the
+// logits (FLINT_NEXPERT per token); the first consumer computes the top-k (see ggml_cuda_flint_topk_flush)
 struct ggml_cuda_topk_deferred {
-    const void *  ids_src = nullptr; // data of the ids tensor, nullptr if nothing is deferred
-    const float * logits  = nullptr;
-    const float * bias    = nullptr;
-    int32_t *     ids     = nullptr;
-    float *       weights = nullptr;
-    int           n_used  = 0;
+    const void *  ids_src  = nullptr; // data of the ids tensor, nullptr if nothing is deferred
+    const float * logits   = nullptr;
+    const float * bias     = nullptr;
+    int32_t *     ids      = nullptr;
+    float *       weights  = nullptr;
+    int64_t       ids_s1   = 0; // token strides of ids and weights
+    int64_t       w_s1     = 0;
+    int           n_tokens = 0;
+    int           n_used   = 0;
     bool          norm    = false;
     float         clamp   = 0.0f;
     float         scale   = 1.0f;
@@ -1452,6 +1483,11 @@ struct ggml_backend_cuda_context {
     static constexpr int    q8_1_max_ncols = 8192;
     static constexpr size_t q8_1_buf_size  = q8_1_max_rows * (q8_1_max_ncols / QK8_1) * sizeof(block_q8_1);
 
+    // a q8_1 copy of nrows rows of ncols values fits into a buffer (more rows if they are shorter)
+    static constexpr bool q8_1_fits(const int64_t nrows, const int64_t ncols) {
+        return ncols <= q8_1_max_ncols && nrows * ncols <= (int64_t) q8_1_max_rows * q8_1_max_ncols;
+    }
+
     const ggml_tensor * q8_1_src    = nullptr;
     void *              q8_1_buf[2] = { nullptr, nullptr };
     int                 q8_1_cur    = 0;
@@ -1473,8 +1509,11 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_topk_deferred topk_deferred;
 
-    // weight whose start is kept in the persisting part of L2 (see ggml_cuda_mul_mat_vec_q)
-    const void * l2_persist = nullptr;
+    // weight whose start is kept in the persisting part of L2 (see ggml_cuda_mul_mat_vec_q); the window is used only in
+    // graphs of few tokens (l2_persist_on), other graphs first return the persisting lines to normal L2 (l2_resident)
+    const void * l2_persist   = nullptr;
+    bool        l2_persist_on = false;
+    bool        l2_resident   = false;
 
     ggml_cuda_d2h_overlap d2h;
     // small host to device copies of set_tensor_async, staged in pinned memory and sent with one batched copy before the
@@ -1486,9 +1525,21 @@ struct ggml_backend_cuda_context {
     std::vector<const void *> h2d_srcs;
     std::vector<size_t>       h2d_sizes;
 
-    // zero-initialized scratch of single-token fused kernels (flint-fused.cu): counters that the last block resets
-    static constexpr size_t fused_scratch_size = 64 * 1024;
+    // zero-initialized scratch of the fused kernels: flint-fused.cu (counters that the last block resets) uses the bytes up to
+    // fused_scratch_mmid_offset, the rest holds the expert segments of the grouped mul_mat_id_multi (mmid-multi.cu)
+    static constexpr size_t fused_scratch_size        = 64 * 1024;
+    static constexpr size_t fused_scratch_mmid_offset = 16 * 1024;
     void * fused_scratch = nullptr;
+
+    // the ids whose expert segments are in the scratch: a later mul_mat_id_multi with the same ids (down after gate_up)
+    // does not sort them again
+    struct mmid_sort_key {
+        const ggml_tensor * ids      = nullptr;
+        int                 n_sh     = 0;
+        int                 n_routed = 0;
+        bool operator==(const mmid_sort_key & o) const { return ids == o.ids && n_sh == o.n_sh && n_routed == o.n_routed; }
+    };
+    mmid_sort_key mmid_sorted;
 
     void * get_fused_scratch() {
         if (fused_scratch == nullptr) {

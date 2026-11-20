@@ -8,12 +8,18 @@
 //   -> top-k -> normalized weights, in one launch (the last block does the top-k). Also writes the normalized activations
 //   (F32 and q8_1, registered with the q8_1 cache for the following expert matmul).
 
-// ggml_cuda_flint_attn: Q/K RMS_NORM -> MUL (-> ROPE), SET_ROWS of K and V, FLASH_ATTN_EXT for one token, in one launch.
-//   One block per Q head. The output is also written as q8_1 and registered with the q8_1 cache for the output projection.
+// ggml_cuda_flint_attn: Q/K RMS_NORM -> MUL (-> ROPE), SET_ROWS of K and V, FLASH_ATTN_EXT for up to FLINT_ATTN_MAX_TOKENS tokens
+//   (up to FLINT_MAX_TOKENS per KV stream), in one launch.
+//   One block per Q head and token. The output is also written as q8_1 and registered with the q8_1 cache for the output projection.
 
 #define FLINT_NEXPERT 256
 
 #define FLINT_MAX_USED 8
+
+// tokens of the multi-token fused kernels (norm_mmvq, norm_glu, mmvq_add, attn, route); more are slower than the unfused ops
+#define FLINT_MAX_TOKENS 4
+// tokens of flint_attn: its blocks are per token, so more tokens of different streams (one per user in decode) are cheap
+#define FLINT_ATTN_MAX_TOKENS 8
 
 // sigmoid + bias top-k of the FLINT_NEXPERT logits, bit-exact with topk_moe_cuda: the same selection (larger value first,
 // ties to the lower index) and the same sum of the weights (lane e % WARP_SIZE adds its experts in selection order, then
@@ -144,20 +150,20 @@ struct ggml_cuda_flint_route_args {
 bool ggml_cuda_flint_route_supported(ggml_backend_cuda_context & ctx, const ggml_cuda_flint_route_args & args);
 void ggml_cuda_flint_route(ggml_backend_cuda_context & ctx, const ggml_cuda_flint_route_args & args);
 
-// ggml_cuda_flint_norm_mmvq: RMS_NORM -> MUL (norm weight) -> MUL_MAT (Q4_0) for one token: every block normalizes and
+// ggml_cuda_flint_norm_mmvq: RMS_NORM -> MUL (norm weight) -> MUL_MAT (Q4_0) for up to FLINT_MAX_TOKENS tokens: every block normalizes and
 //   quantizes the activations itself (bit-exact with rms_norm_mul_q8_1_f32 + the mul_mat_vec_q small_k path).
 bool ggml_cuda_flint_norm_mmvq_supported(const ggml_tensor * x, const ggml_tensor * norm_w, const ggml_tensor * mm);
 void ggml_cuda_flint_norm_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * norm_w,
         float eps, ggml_tensor * mm);
 
-// ggml_cuda_flint_norm_glu: RMS_NORM -> MUL -> MUL_MAT (up), MUL_MAT (gate) -> SWIGLU for one token, as flint_norm_mmvq with
+// ggml_cuda_flint_norm_glu: RMS_NORM -> MUL -> MUL_MAT (up), MUL_MAT (gate) -> SWIGLU for up to FLINT_MAX_TOKENS tokens, as flint_norm_mmvq with
 //   the gate fused like mul_mat_vec_q does it.
 bool ggml_cuda_flint_norm_glu_supported(const ggml_tensor * x, const ggml_tensor * norm_w, const ggml_tensor * up,
         const ggml_tensor * gate, const ggml_tensor * glu);
 void ggml_cuda_flint_norm_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * norm_w,
         float eps, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * glu);
 
-// ggml_cuda_flint_mmvq_add: MUL_MAT (Q4_0, activations from the q8_1 cache) -> ADD for one token, bit-exact with
+// ggml_cuda_flint_mmvq_add: MUL_MAT (Q4_0, activations from the q8_1 cache) -> ADD for up to FLINT_MAX_TOKENS tokens, bit-exact per token with
 //   mul_mat_vec_q (4 warps, 1 row per block) with the fused add; the weights are loaded before the dependency wait.
 bool ggml_cuda_flint_mmvq_add_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * add);
 void ggml_cuda_flint_mmvq_add(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * add);
@@ -175,7 +181,8 @@ struct ggml_cuda_flint_attn_args {
     const ggml_tensor * k_set;    // SET_ROWS into the K cache
     const ggml_tensor * v_set;    // SET_ROWS into the V cache
     ggml_tensor *       fa;       // FLASH_ATTN_EXT
-    const ggml_tensor * fa_2d;    // [D*n_head, 1] reshape of the output, registered with the q8_1 cache (or nullptr)
+    const ggml_tensor * fa_2d;    // [D*n_head, n_tokens] reshape of the output, registered with the q8_1 cache (or nullptr)
+    bool                f32_out;  // write the F32 output (false: only the q8_1 copy is read)
 };
 
 bool ggml_cuda_flint_attn_supported(ggml_backend_cuda_context & ctx, const ggml_cuda_flint_attn_args & args);
