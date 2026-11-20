@@ -26,6 +26,7 @@ static constexpr __host__ __device__ int mmq_few_unit_size_of() {
 // src0 bytes per 256 values, 0 for the types without a few-row decoder.
 static constexpr __host__ __device__ int mmq_few_unit_size(const ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_0:   return mmq_few_unit_size_of<GGML_TYPE_Q4_0>();
         case GGML_TYPE_Q8_0:   return mmq_few_unit_size_of<GGML_TYPE_Q8_0>();
         case GGML_TYPE_Q3_K:   return mmq_few_unit_size_of<GGML_TYPE_Q3_K>();
         case GGML_TYPE_Q4_K:   return mmq_few_unit_size_of<GGML_TYPE_Q4_K>();
@@ -76,7 +77,7 @@ static constexpr __host__ __device__ int mmq_few_nbytes_shared(const ggml_type t
 
 // With Q6_K and Q8_0 two CUDA blocks with 32-row tiles would not fit into an SM.
 static constexpr __host__ __device__ bool mmq_few_tall_supported(const ggml_type type) {
-    return type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
            type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS;
 }
 
@@ -96,6 +97,36 @@ static __device__ __forceinline__ void mmq_few_load_y(mmq_few_y_frag & yf, const
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         yf.ds[j] = y[4*WARP_SIZE + 4*(threadIdx.x % 4) + j];
+    }
+}
+
+// The same fragments gathered from q8_1 rows (the q8_1 cache, D4 layout): unit iu of the columns col0 .. col0 + 7, columns
+// from ncols on are zero.
+static __device__ __forceinline__ void mmq_few_load_y_q8_1(
+        mmq_few_y_frag & yf, const block_q8_1 * y, const int64_t stride_col, const int ncols, const int col0, const int iu) {
+    const int g = threadIdx.x / 4;
+    const int t = threadIdx.x % 4;
+    const int ib0 = iu*(QK_K/QK8_1);
+    const block_q8_1 * yg = y + int64_t(col0 + g)*stride_col + ib0;
+    const block_q8_1 * y0 = y + int64_t(col0 + 2*t + 0)*stride_col + ib0; // the columns of the scales
+    const block_q8_1 * y1 = y + int64_t(col0 + 2*t + 1)*stride_col + ib0;
+    const bool ok_g = col0 + g         < ncols;
+    const bool ok_0 = col0 + 2*t + 0   < ncols;
+    const bool ok_1 = col0 + 2*t + 1   < ncols;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        int   q[4];
+        float d[4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int s = 2*j + h;
+            q[2*h + 0] = ok_g ? get_int_b4(yg[s].qs, t)     : 0;
+            q[2*h + 1] = ok_g ? get_int_b4(yg[s].qs, 4 + t) : 0;
+            d[2*h + 0] = ok_0 ? __low2float(y0[s].ds) : 0.0f;
+            d[2*h + 1] = ok_1 ? __low2float(y1[s].ds) : 0.0f;
+        }
+        yf.qs[j] = make_int4(q[0], q[1], q[2], q[3]);
+        yf.ds[j] = make_int4(__float_as_int(d[0]), __float_as_int(d[1]), __float_as_int(d[2]), __float_as_int(d[3]));
     }
 }
 
@@ -396,7 +427,7 @@ static __device__ __forceinline__ void mmq_few_vec_dot_iq4_xs(const char * const
     mmq_few_add_scaled(sum, d, sum_d);
 }
 
-// Q8_0 and IQ4_NL have a block with its own scale per 32 values.
+// Q4_0, Q8_0 and IQ4_NL have a block with its own scale per 32 values.
 template <ggml_type type, int ncg>
 static __device__ __forceinline__ void mmq_few_vec_dot_q8_0_iq4_nl(const char * const (&x)[2], const mmq_few_y_frag (&yf)[ncg], float (&sum)[ncg][4]) {
     const int t = threadIdx.x % 4;
@@ -408,7 +439,14 @@ static __device__ __forceinline__ void mmq_few_vec_dot_q8_0_iq4_nl(const char * 
         float d[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            if constexpr (type == GGML_TYPE_Q8_0) {
+            if constexpr (type == GGML_TYPE_Q4_0) {
+                // the low nibbles are the values [4t, 4t + 4), the high nibbles [16 + 4t, 16 + 4t + 4), both offset by 8
+                const block_q4_0 * bx = (const block_q4_0 *) x[r] + s;
+                const int q = get_int_b2(bx->qs, t);
+                lo[r] = __vsubss4( q       & 0x0F0F0F0F, 0x08080808);
+                hi[r] = __vsubss4((q >> 4) & 0x0F0F0F0F, 0x08080808);
+                d[r]  = __half2float(bx->d);
+            } else if constexpr (type == GGML_TYPE_Q8_0) {
                 const block_q8_0 * bx = (const block_q8_0 *) x[r] + s;
                 lo[r] = get_int_b2(bx->qs,      t);
                 hi[r] = get_int_b2(bx->qs + 16, t);
@@ -465,7 +503,7 @@ static __device__ __forceinline__ void mmq_few_vec_dot_iq3_s(const char * const 
 
 template <ggml_type type, int ncg>
 static __device__ __forceinline__ void mmq_few_vec_dot(const char * const (&x)[2], const mmq_few_y_frag (&yf)[ncg], float (&sum)[ncg][4]) {
-    if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL) {
+    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL) {
         mmq_few_vec_dot_q8_0_iq4_nl<type, ncg>(x, yf, sum);
     } else if constexpr (type == GGML_TYPE_Q3_K) {
         mmq_few_vec_dot_q3_K<ncg>(x, yf, sum);
@@ -484,10 +522,12 @@ static __device__ __forceinline__ void mmq_few_vec_dot(const char * const (&x)[2
 
 #endif // defined(CP_ASYNC_AVAILABLE)
 
-template <ggml_type type, int ncg, int nmt>
+// y_q8_1: src1 is one channel of q8_1 rows (stride_col_y blocks) instead of the fragment layout. res: added to the result
+// (fused ADD, stride_col_res), or nullptr.
+template <ggml_type type, int ncg, int nmt, bool y_q8_1>
 __launch_bounds__(MMQ_FEW_NWARPS*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_q_few(
-        const char * x, const int4 * y_ptr, float * dst,
+        const char * x, const void * y_ptr, const int64_t stride_col_y, const float * res, const int stride_col_res, float * dst,
         const int nunits, const int nrows_x, const int ncols_dst, const int64_t stride_row_x, const int stride_col_dst,
         const int channel_ratio, const int64_t stride_channel_x, const int stride_channel_dst,
         const int sample_ratio, const int64_t stride_sample_x, const int stride_sample_dst, const bool x_is_constant) {
@@ -517,7 +557,8 @@ static __global__ void mul_mat_q_few(
 
     x   += int64_t(sample_dst/sample_ratio)*stride_sample_x + int64_t(channel_dst/channel_ratio)*stride_channel_x;
     dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
-    const int4 * GGML_CUDA_RESTRICT y = y_ptr + (int64_t(sample_dst)*nchannels + channel_dst)*nunits*ncg*MMQ_FEW_Q8_1_INT4;
+    const int4 * GGML_CUDA_RESTRICT y = (const int4 *) y_ptr + (int64_t(sample_dst)*nchannels + channel_dst)*nunits*ncg*MMQ_FEW_Q8_1_INT4;
+    static_assert(!y_q8_1 || mmq_few_ds_layout(type) == MMQ_Q8_1_DS_LAYOUT_D4, "q8_1 rows hold no sums of the quantized values");
 
     // No bounds check for the units, the gate makes nunits a multiple of nunits_stage.
     // The extra bytes of unaligned data are inside the allocation, which ggml aligns and pads to 128 bytes.
@@ -592,7 +633,11 @@ static __global__ void mul_mat_q_few(
     auto load_y = [&](mmq_few_y_frag (&yf)[ncg], const int iu) {
 #pragma unroll
         for (int c = 0; c < ncg; ++c) {
-            mmq_few_load_y(yf[c], y + (int64_t(iu)*ncg + c)*MMQ_FEW_Q8_1_INT4);
+            if constexpr (y_q8_1) {
+                mmq_few_load_y_q8_1(yf[c], (const block_q8_1 *) y_ptr, stride_col_y, ncols_dst, c*MMQ_FEW_NCOLS, iu);
+            } else {
+                mmq_few_load_y(yf[c], y + (int64_t(iu)*ncg + c)*MMQ_FEW_Q8_1_INT4);
+            }
         }
     };
 
@@ -675,13 +720,13 @@ static __global__ void mul_mat_q_few(
                 const int i = row0 + MMQ_FEW_NROWS*m + tile<16, 8, int>::get_i(l);
                 const int j = c*MMQ_FEW_NCOLS + tile<16, 8, int>::get_j(l);
                 if (i < nrows_x && j < ncols_dst) {
-                    dst[int64_t(j)*stride_col_dst + i] = sum[m][c][l];
+                    dst[int64_t(j)*stride_col_dst + i] = res ? sum[m][c][l] + res[int64_t(j)*stride_col_res + i] : sum[m][c][l];
                 }
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(x, y_ptr, dst, nunits, nrows_x, ncols_dst, stride_row_x, stride_col_dst,
+    GGML_UNUSED_VARS(x, y_ptr, stride_col_y, res, stride_col_res, dst, nunits, nrows_x, ncols_dst, stride_row_x, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_dst, x_is_constant);
     NO_DEVICE_CODE;
@@ -695,9 +740,18 @@ static bool mmq_few_is_constant(const ggml_tensor * src0) {
         !(x_root->flags & GGML_TENSOR_FLAG_PARAM);
 }
 
-template <ggml_type type, int ncg, int nmt>
+// src1 of a launch: the fragment layout (quantize_mmq_few_q8_1) or q8_1 rows (the q8_1 cache), and the optional residual
+struct mmq_few_args {
+    const void  * y;
+    bool          y_q8_1;
+    int64_t       stride_col_y;   // q8_1 rows: blocks per column
+    const float * res;            // fused ADD or nullptr
+    int           stride_col_res;
+};
+
+template <ggml_type type, int ncg, int nmt, bool y_q8_1>
 static void launch_mul_mat_q_few(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-        const int4 * src1_q, cudaStream_t stream) {
+        const mmq_few_args & args, cudaStream_t stream) {
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     const int nunits = ne00 / QK_K;
@@ -705,18 +759,31 @@ static void launch_mul_mat_q_few(const ggml_tensor * src0, const ggml_tensor * s
 
     const int warp_size     = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int nbytes_shared = mmq_few_nbytes_shared(type, ncg, nmt);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_few<type, ncg, nmt>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_few<type, ncg, nmt, y_q8_1>), nbytes_shared);
 
     const bool x_is_constant = mmq_few_is_constant(src0);
 
     const dim3 block_nums((ne01 + nmt*MMQ_FEW_NROWS - 1) / (nmt*MMQ_FEW_NROWS), ne12, ne13);
     const dim3 block_dims(warp_size, MMQ_FEW_NWARPS, 1);
     const ggml_cuda_kernel_launch_params params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_q_few<type, ncg, nmt>, params,
-        (const char *) src0->data, src1_q, (float *) dst->data,
+    ggml_cuda_kernel_launch(mul_mat_q_few<type, ncg, nmt, y_q8_1>, params,
+        (const char *) src0->data, args.y, args.stride_col_y, args.res, args.stride_col_res, (float *) dst->data,
         nunits, (int) ne01, (int) ne1, (int64_t) nb01, (int) (nb1/sizeof(float)),
         (int) (ne12/ne02), (int64_t) nb02, (int) (nb2/sizeof(float)),
         (int) (ne13/ne03), (int64_t) nb03, (int) (nb3/sizeof(float)), x_is_constant);
+}
+
+template <ggml_type type, int ncg, int nmt>
+static void launch_mul_mat_q_few_src1(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const mmq_few_args & args, cudaStream_t stream) {
+    if constexpr (mmq_few_ds_layout(type) == MMQ_Q8_1_DS_LAYOUT_D4) {
+        if (args.y_q8_1) {
+            launch_mul_mat_q_few<type, ncg, nmt, true>(src0, src1, dst, args, stream);
+            return;
+        }
+    }
+    GGML_ASSERT(!args.y_q8_1);
+    launch_mul_mat_q_few<type, ncg, nmt, false>(src0, src1, dst, args, stream);
 }
 
 static int mmq_few_ncg(const int64_t ncols) {
@@ -731,35 +798,41 @@ static int mmq_few_nmt(const ggml_type type, const int ncg, const int64_t nrows_
 
 template <ggml_type type>
 static void launch_mul_mat_q_few_tall(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-        const int4 * src1_q, cudaStream_t stream) {
+        const mmq_few_args & args, cudaStream_t stream) {
     if constexpr (mmq_few_tall_supported(type)) {
         if (mmq_few_nmt(type, 2, src0->ne[1]) == 2) {
-            launch_mul_mat_q_few<type, 2, 2>(src0, src1, dst, src1_q, stream);
+            launch_mul_mat_q_few_src1<type, 2, 2>(src0, src1, dst, args, stream);
             return;
         }
     }
-    launch_mul_mat_q_few<type, 2, 1>(src0, src1, dst, src1_q, stream);
+    launch_mul_mat_q_few_src1<type, 2, 1>(src0, src1, dst, args, stream);
 }
 
 template <ggml_type type>
 static void launch_mul_mat_q_few_switch_ncg(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-        const int4 * src1_q, const int ncg, cudaStream_t stream) {
+        const mmq_few_args & args, const int ncg, cudaStream_t stream) {
     switch (ncg) {
         case 1:
-            launch_mul_mat_q_few<type, 1, 1>(src0, src1, dst, src1_q, stream);
+            launch_mul_mat_q_few_src1<type, 1, 1>(src0, src1, dst, args, stream);
             break;
         case 2:
-            launch_mul_mat_q_few_tall<type>(src0, src1, dst, src1_q, stream);
+            launch_mul_mat_q_few_tall<type>(src0, src1, dst, args, stream);
             break;
         case 3:
-            launch_mul_mat_q_few<type, 3, 1>(src0, src1, dst, src1_q, stream);
+            launch_mul_mat_q_few_src1<type, 3, 1>(src0, src1, dst, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
     }
 }
 
-void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+bool ggml_cuda_mul_mat_q_few_q8_1_ok(const ggml_tensor * src0, const ggml_tensor * src1) {
+    return mmq_few_ds_layout(src0->type) == MMQ_Q8_1_DS_LAYOUT_D4 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src1->ne[0] % MATRIX_ROW_PADDING == 0;
+}
+
+void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_tensor * res, const void * src1_q8_1) {
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
@@ -770,40 +843,56 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(ne11 <= MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS);
     GGML_ASSERT(ne00 % QK_K == 0);
     GGML_ASSERT(ne12 % ne02 == 0 && ne13 % ne03 == 0);
+    GGML_ASSERT(!res || (res->type == GGML_TYPE_F32 && ggml_are_same_shape(res, dst) && res->nb[0] == sizeof(float) &&
+                         ne2 == 1 && ne3 == 1));
+    GGML_ASSERT(!src1_q8_1 || ggml_cuda_mul_mat_q_few_q8_1_ok(src0, src1));
 
     cudaStream_t stream = ctx.stream();
 
     const int nunits = ne00 / QK_K;
     const int ncg    = mmq_few_ncg(ne11);
 
-    ggml_cuda_pool_alloc<int4> src1_q(ctx.pool(), int64_t(ne12)*ne13*nunits*ncg*MMQ_FEW_Q8_1_INT4);
-    quantize_mmq_few_q8_1_cuda((const float *) src1->data, src1_q.get(), mmq_few_ds_layout(src0->type), ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
-        ne11, ne12, ne13, stream);
+    mmq_few_args args = {};
+    args.res            = res ? (const float *) res->data : nullptr;
+    args.stride_col_res = res ? (int) (res->nb[1]/sizeof(float)) : 0;
+    args.y              = src1_q8_1;
+    args.y_q8_1         = src1_q8_1 != nullptr;
+    args.stride_col_y   = ne10/QK8_1;
+    ggml_cuda_pool_alloc<int4> src1_q(ctx.pool());
+    if (!args.y_q8_1) {
+        src1_q.alloc(int64_t(ne12)*ne13*nunits*ncg*MMQ_FEW_Q8_1_INT4);
+        quantize_mmq_few_q8_1_cuda((const float *) src1->data, src1_q.get(), mmq_few_ds_layout(src0->type), ne10, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float),
+            ne11, ne12, ne13, stream);
+        args.y = src1_q.get();
+    }
 
     switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q4_0>(src0, src1, dst, args, ncg, stream);
+            break;
         case GGML_TYPE_Q8_0:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q8_0>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q8_0>(src0, src1, dst, args, ncg, stream);
             break;
         case GGML_TYPE_Q3_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q3_K>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q3_K>(src0, src1, dst, args, ncg, stream);
             break;
         case GGML_TYPE_Q4_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q4_K>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q4_K>(src0, src1, dst, args, ncg, stream);
             break;
         case GGML_TYPE_Q5_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q5_K>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q5_K>(src0, src1, dst, args, ncg, stream);
             break;
         case GGML_TYPE_Q6_K:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q6_K>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_Q6_K>(src0, src1, dst, args, ncg, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ3_S>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ3_S>(src0, src1, dst, args, ncg, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_NL>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_NL>(src0, src1, dst, args, ncg, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_XS>(src0, src1, dst, src1_q.get(), ncg, stream);
+            launch_mul_mat_q_few_switch_ncg<GGML_TYPE_IQ4_XS>(src0, src1, dst, args, ncg, stream);
             break;
         default:
             GGML_ABORT("unsupported type for few-row MMQ");
@@ -829,9 +918,10 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
         return 0;
     }
     if (cc == GGML_CUDA_CC_DGX_SPARK) { // tuned on DGX Spark GB10
-        return type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL ? 8 : 2;
+        return type == GGML_TYPE_Q4_0 ? 0 : type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL ? 8 : 2;
     }
     switch (type) { // all GPUs except DGX Spark, tuned on RTX 5090
+        case GGML_TYPE_Q4_0:   return 5;
         case GGML_TYPE_Q3_K:   return 3;
         case GGML_TYPE_Q5_K:   return 3;
         case GGML_TYPE_Q4_K:   return 4;
@@ -863,9 +953,15 @@ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * 
 
 #else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_tensor * res, const void * src1_q8_1) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, res, src1_q8_1);
     GGML_ABORT("few-row MMQ is not supported on HIP or MUSA");
+}
+
+bool ggml_cuda_mul_mat_q_few_q8_1_ok(const ggml_tensor * src0, const ggml_tensor * src1) {
+    GGML_UNUSED_VARS(src0, src1);
+    return false;
 }
 
 bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {

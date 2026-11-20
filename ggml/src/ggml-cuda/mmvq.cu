@@ -658,9 +658,11 @@ static __global__ void mul_mat_vec_q(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    ggml_cuda_pdl_lc();
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const uint32_t bx   = fusion.interleave ? (blockIdx.x % 2 == 0 ? blockIdx.x/2 : gridDim.x - 1 - blockIdx.x/2) : blockIdx.x;
+    const     int row0 = rows_per_cuda_block*bx;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -896,6 +898,34 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
                 dst[j*stride_col_dst + i] = result;
+            }
+        }
+    }
+
+    if (fusion.progress != nullptr) {
+        // the rows of the warp are written before they are counted (release, a copy engine waits for the count): unlike
+        // __threadfence() this does not invalidate the L1 cache that the other blocks of the SM read the activations from
+        __syncwarp();
+        if (threadIdx.x == 0) {
+            const uint32_t n = fusion.progress_nrows;
+            uint32_t k_cur = 0;
+            uint32_t count = 0;
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const uint32_t r = row0 + i;
+                if (r >= n) {
+                    break;
+                }
+                const uint32_t k = ggml_cuda_d2h_overlap::chunk_of(r, n, fusion.progress_chunks, fusion.progress_mul);
+                if (count > 0 && k != k_cur) {
+                    ggml_cuda_red_add_release(&fusion.progress[k_cur], count);
+                    count = 0;
+                }
+                k_cur = k;
+                count++;
+            }
+            if (count > 0) {
+                ggml_cuda_red_add_release(&fusion.progress[k_cur], count);
             }
         }
     }
@@ -1267,7 +1297,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
-            if (should_use_small_k(c_ncols_dst)) {
+            // large matrices: the small_k layout (nwarps rows per block) so that all rows fit in one wave and the next kernel can start early
+            if (should_use_small_k(c_ncols_dst) || (table_id == MMVQ_PARAMETERS_GENERIC && nrows_x >= 4096)) {
                 launch(std::true_type{},  std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
@@ -1487,6 +1518,23 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// A matmul with a weight larger than the persisting part of L2 (e.g. the output projection) is bound by DRAM bandwidth:
+// keep the start of the weight in L2 across graph evaluations (one weight per context).
+static bool ggml_cuda_mmvq_l2_persist(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids) {
+    static const bool disabled = getenv("GGML_CUDA_NO_L2_PERSIST") != nullptr;
+    const size_t max_bytes = ggml_cuda_info().devices[ctx.device].l2_persist_max;
+    if (disabled || !ctx.l2_persist_on || ids || max_bytes == 0 || !src0->buffer || ggml_nbytes(src0) <= max_bytes ||
+            ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+    if (!ctx.l2_persist) {
+        CUDA_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, max_bytes));
+        ctx.l2_persist = src0->data;
+    }
+    ctx.l2_resident = ctx.l2_resident || ctx.l2_persist == src0->data;
+    return ctx.l2_persist == src0->data;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1616,11 +1664,48 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    // persisting L2 window: the row blocks of both ends run in turn, so that blocks reading from L2 run alongside those
+    // reading from DRAM
+    const bool l2_persist = ggml_cuda_mmvq_l2_persist(ctx, src0, ids);
+    if (l2_persist) {
+        fusion_local.interleave = true;
+        cudaStreamAttrValue attr = {};
+        attr.accessPolicyWindow.base_ptr  = src0->data;
+        attr.accessPolicyWindow.num_bytes = ggml_cuda_info().devices[ctx.device].l2_persist_max;
+        attr.accessPolicyWindow.hitRatio  = 1.0f;
+        attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+        attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+        CUDA_CHECK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr));
+    }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // count the finished rows for the copy of the output to the host (see ggml_cuda_d2h_overlap)
+    if (!ids && ncols_dst == 1 && ne2 == 1 && ne3 == 1 && ctx.curr_stream_no == 0 && ctx.d2h.counts(dst)) {
+        fusion_local.progress        = ctx.d2h.counters;
+        fusion_local.progress_nrows  = ne01;
+        fusion_local.progress_chunks = ctx.d2h.n_chunks;
+        fusion_local.progress_mul    = ctx.d2h.mul;
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        if (capture == cudaStreamCaptureStatusNone) {
+            ctx.d2h.launches++;
+            ctx.d2h.pending = true;
+        } else {
+            ctx.d2h.captured++;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1_cached ? src1_q8_1_cached : src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+
+    if (l2_persist) {
+        cudaStreamAttrValue attr = {};
+        CUDA_CHECK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr));
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

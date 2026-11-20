@@ -1802,6 +1802,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    // flint: with the whole model on one GPU, the input layer goes there too, so that decoding a token needs no CPU split
+    // (embedding lookup on the CPU, a synchronization and a copy of the embedding: a few us per token)
+    if (arch == LLM_ARCH_FLINT && pimpl->dev_output.dev != cpu_dev) {
+        bool one_dev = true;
+        for (int il = 0; il < n_layer_all; ++il) {
+            one_dev = one_dev && pimpl->dev_layer[il].dev == pimpl->dev_output.dev;
+        }
+        if (one_dev) {
+            pimpl->dev_input = pimpl->dev_output;
+        }
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
